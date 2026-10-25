@@ -1,0 +1,58 @@
+name: AppImage
+
+# Builds the AppImage on every push to main and on pull requests (kept as a
+# workflow artifact), and attaches it to a GitHub release for tags v*.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  appimage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Lint
+        run: |
+          pip install pyflakes
+          python -m pyflakes dota2tools
+
+      - name: Build
+        run: |
+          pip install python-appimage
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then export VERSION="${GITHUB_REF_NAME#v}"; fi
+          packaging/appimage/build.sh
+
+      - name: Smoke test
+        run: |
+          # What a desktop has and the runner doesn't: OpenGL/EGL, fonts, keyboard maps.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+          app=$(ls Dota2-Workshop-Tools*.AppImage)
+          chmod +x "$app"
+          APPIMAGE_EXTRACT_AND_RUN=1 "./$app" --help
+          ./"$app" --appimage-extract >/dev/null
+          QT_QPA_PLATFORM=offscreen squashfs-root/usr/bin/python3.12 -I -c \
+            "import dota2tools.gui, dota2tools.maprender, cv2, numpy, PIL; from PySide6 import QtWidgets; QtWidgets.QApplication([]); print('ok')"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Dota2-Workshop-Tools-AppImage
+          path: Dota2-Workshop-Tools*.AppImage
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Dota2-Workshop-Tools*.AppImage
+          generate_release_notes: true

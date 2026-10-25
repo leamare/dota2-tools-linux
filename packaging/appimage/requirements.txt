@@ -1,0 +1,5 @@
+PySide6-Essentials
+numpy
+pillow
+opencv-python-headless
+local+dota2tools
