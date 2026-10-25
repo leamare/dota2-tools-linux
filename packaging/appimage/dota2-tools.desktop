@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Dota 2 Workshop Tools
+Comment=Dota 2 Workshop Tools beside a native Linux Dota 2
+Exec=dota2-tools
+Icon=dota2-tools
+Categories=Game;Development;
+Terminal=false
+StartupWMClass=dota2-tools

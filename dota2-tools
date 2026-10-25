@@ -1,0 +1,14 @@
+#!/bin/sh
+# Dota 2 Workshop Tools for Linux. No arguments: the launcher window (the
+# installer while nothing is installed). dota2-tools --help for the commands.
+# Runs with the first Python that has Qt (PySide6 or PyQt6) -- the system's
+# first, so an activated virtualenv without them doesn't hide them.
+here="$(dirname "$(readlink -f "$0")")"
+py=""
+for c in /usr/bin/python3 python3; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c "import importlib.util as u, sys; sys.exit(0 if u.find_spec('PySide6') or u.find_spec('PyQt6') else 1)" 2>/dev/null; then
+    py="$c"; break
+  fi
+done
+[ -n "$py" ] || py=python3
+PYTHONPATH="$here${PYTHONPATH:+:$PYTHONPATH}" exec "$py" -m dota2tools "$@"
