@@ -7,6 +7,9 @@
     dota2-tools launch [--addon NAME] [--map MAP] [--cfg] [--no-update] [--vconsole-terminal] [-- game arguments]
     dota2-tools vconsole [--port N] [--terminal]   the game's console (waits for the game; --terminal: in a new window)
     dota2-tools proton [list | use NAME | install NAME | install-ge [TAG] | remove NAME | runtime]
+    dota2-tools builds [list [--app APP] [--downloaded] | refresh | import FILE [--depot N | --app N]
+                       | download BUILD [--username NAME] [--qr | --client] | commands BUILD
+                       | use BUILD | reset | delete BUILD]
     dota2-tools new-addon FOLDER [--title NAME] [--map MAP] [--from ADDON] [--from-map MAP]
     dota2-tools render maps [--addon NAME]
     dota2-tools render auto --map MAP [--addon NAME]      prepare, export in a hidden SFM, stitch
@@ -21,9 +24,10 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
-from . import core, proton
+from . import builds, core, proton
 
 
 def locate(path=None):
@@ -73,18 +77,17 @@ def cmd_launch(tools, args, extra):
         print(text + (f": dota2-tools proton install {appid}" if appid else ""), file=sys.stderr)
     if proton.problems(tools):
         return 1
-    if not args.no_update and s.get("auto_update", True):
+    if tools.game_root != tools.root:
+        print(f"the active build: {tools.game_root} (dota2-tools builds reset: back to the current one)")
+    elif not args.no_update and s.get("auto_update", True):
         try:
             if core.update(tools, if_needed=True):
                 print("updated to the native install's build")
         except (SystemExit, core.NeedsClient) as e:
             if tools.state.get("buildid") != tools.target()["buildid"]:
                 raise SystemExit(f"could not update the tools: {e}")
-    if args.cfg:
-        exe, game = "dota2cfg.exe", ["-steam", "-dx11"] + extra
-    else:
-        exe, game = "dota2.exe", core.game_args(args.addon or "", args.map or "", not args.no_vconsole,
-                                                " ".join(extra))
+    exe, game = core.game_command(tools, args.cfg, args.addon or "", args.map or "", not args.no_vconsole,
+                                  " ".join(extra))
     cmd, env, cwd = core.launch_command(tools, exe, game)
     print(" ".join(cmd), flush=True)
     if not args.cfg and (args.vconsole_terminal or s["launch"].get("vconsole_terminal")):
@@ -131,6 +134,56 @@ def cmd_proton(tools, args):
         else:
             proton.steam_install(proton.SNIPER)
             print("Steam asked to install the Steam Linux Runtime 3.0 (sniper)")
+    return 0
+
+
+def cmd_builds(tools, args):
+    what = args.what or "list"
+    if what == "refresh":
+        builds.refresh(tools)
+        what = "list"
+    if what == "list":
+        for r in builds.rows(tools):
+            if (args.app and r["app"] != args.app) or (args.downloaded and not r["status"]):
+                continue
+            when = time.strftime("%Y-%m-%d %H:%M", time.gmtime(r["time"]))
+            print(f"{r['app']:<7} {str(r['buildid'] or ''):>9} {r['manifest']:>20} {when}  {r['status'] or '-':10} "
+                  f"{r['remark']}" + (f"  (no manifest of {', '.join(map(str, r['missing']))})" if r["missing"] else ""))
+        print(f"active: {tools.game_root}")
+        return 0
+    if what == "import":
+        if not args.build:
+            raise SystemExit("builds import FILE (a SteamDB page saved from the browser)")
+        try:
+            kind, ident, n = builds.import_file(tools, args.build, args.depot, args.app)
+        except ValueError as e:
+            raise SystemExit(f"{e}: --depot N or --app N")
+        print(f"{n} entries for {kind} {ident}")
+        return 0
+    if what == "reset":
+        builds.activate(tools, None)
+        print(f"active: the tools folder, {tools.root}")
+        return 0
+    row = builds.find(tools, args.build or "")
+    if not row:
+        raise SystemExit(f"no build {args.build!r}: dota2-tools builds list (a key, manifest or build ID)")
+    if what == "commands":
+        print("\n".join(builds.client_commands(row)))
+    elif what == "download":
+        set_login(tools, args)
+        try:
+            builds.download(tools, row, qr=args.qr, use_client=args.client)
+        except core.NeedsClient as e:
+            print(e, file=sys.stderr)
+            return 2
+    elif what == "use":
+        if row["status"] not in ("downloaded", "active"):
+            raise SystemExit(f"{row['key']} is not downloaded: dota2-tools builds download {row['key']}")
+        builds.activate(tools, row)
+        print(f"active: {row['path']}")
+    elif what == "delete":
+        builds.delete(tools, row)
+        print(f"deleted {row['path']}")
     return 0
 
 
@@ -222,6 +275,17 @@ def main(argv=None):
     p = sub.add_parser("proton", help="installed Proton versions; install, choose, remove")
     p.add_argument("what", nargs="?", choices=["list", "use", "install", "install-ge", "remove", "runtime"])
     p.add_argument("name", nargs="?", help="a Proton's folder name, a Steam app id, or a GE-Proton tag")
+    p = sub.add_parser("builds", help="old builds: list, download, start one instead of the current")
+    p.add_argument("what", nargs="?", choices=["list", "refresh", "import", "download", "commands", "use", "reset",
+                                                "delete"])
+    p.add_argument("build", nargs="?", help="a build (its key, manifest or build ID), or the file to import")
+    p.add_argument("--app", type=int, choices=sorted(builds.APPS), help="list: only this app; import: the app")
+    p.add_argument("--depot", type=int, help="import: the depot of copied text")
+    p.add_argument("--downloaded", action="store_true", help="list: only downloaded builds")
+    p.add_argument("--username", help="download: the Steam account (needed for the tools DLC and app 316570)")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--qr", action="store_true", help="download: log in by QR code")
+    g.add_argument("--client", action="store_true", help="download: through the Steam client's console")
     p = sub.add_parser("new-addon", help="a new addon from Dota's addon_template (or another addon)")
     p.add_argument("folder", help="its folder name (lowercase, digits, _)")
     p.add_argument("--title", default="", help="its name in the game")
@@ -271,6 +335,8 @@ def main(argv=None):
         return 0
     if args.cmd == "proton":
         return cmd_proton(tools, args)
+    if args.cmd == "builds":
+        return cmd_builds(tools, args)
     if args.cmd == "render":
         return cmd_render(tools, args)
     if args.cmd == "new-addon":

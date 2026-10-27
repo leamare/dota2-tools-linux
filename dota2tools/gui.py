@@ -6,11 +6,13 @@ Work runs in a thread; whatever it needs from the user (DepotDownloader's
 password, Steam Guard code, QR code) is asked on the main thread through
 App.call.
 """
+import gzip
 import os
 import re
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 try:
@@ -22,7 +24,7 @@ except ImportError:
         raise SystemExit("The windows need Qt for Python: PySide6 or PyQt6 (pacman -S pyside6, or python-pyqt6). "
                          "The commands work without it: dota2-tools --help")
 
-from . import core, proton
+from . import builds, core, proton
 
 Qt = QtCore.Qt
 
@@ -338,12 +340,14 @@ class App(QtWidgets.QMainWindow):
             self.qr = None
 
     def needs_client(self, e):
-        """The tools DLC from the Steam client's console: the command to copy."""
+        """A depot from the Steam client's console (the tools DLC, an old
+        build's): the command to copy. e.retry: what Continue does (else
+        the update again)."""
         d = QtWidgets.QDialog(self)
-        d.setWindowTitle("Download the Workshop Tools with Steam")
+        d.setWindowTitle("Download with Steam")
         v = QtWidgets.QVBoxLayout(d)
         lab = QtWidgets.QLabel(
-            "The Workshop Tools DLC needs your Steam account. Without logging in here, your running Steam client "
+            "This depot needs your Steam account. Without logging in here, your running Steam client "
             "can download it: open its console, paste this command, wait for “Depot download complete”, then "
             "press Continue.")
         lab.setWordWrap(True)
@@ -354,7 +358,8 @@ class App(QtWidgets.QMainWindow):
         row = QtWidgets.QHBoxLayout()
         for text, fn in (("Copy", lambda: QtWidgets.QApplication.clipboard().setText(e.command)),
                          ("Open Steam console", lambda: subprocess.Popen(["xdg-open", "steam://open/console"])),
-                         ("Continue", lambda: (d.accept(), self.update_tools(use_client=True)))):
+                         ("Continue", lambda: (d.accept(), (getattr(e, "retry", None)
+                                                             or (lambda: self.update_tools(use_client=True)))()))):
             b = QtWidgets.QPushButton(text)
             b.clicked.connect(fn)
             row.addWidget(b)
@@ -509,6 +514,7 @@ class Launcher(App):
         self.render_tab = RenderTab(self)
         tabs.addTab(self.render_tab, "Map renderer")
         tabs.addTab(self.proton_tab(), "Proton")
+        tabs.addTab(self.builds_tab(), "Builds")
         tabs.addTab(self.tools_tab(), "Tools")
         v.addWidget(tabs, 3)
         v.addWidget(self.log_strip(), 0)
@@ -524,6 +530,8 @@ class Launcher(App):
             self.status.setText(f"Cannot read Steam's data: {e}")
             return
         text = f"Dota 2 build {tgt['buildid']}  ·  tools build {state.get('buildid', 'none')}  ·  "
+        if self.tools.game_root != self.tools.root:
+            text = f"<b>Old build active: {self.tools.game_root.name}</b>  ·  " + text
         if not tgt["installed"] or tgt["buildid"] != tgt["current"]:
             text += "<b>Dota has an update pending: update it in Steam first</b>"
         elif current:
@@ -542,7 +550,7 @@ class Launcher(App):
         h = QtWidgets.QHBoxLayout(w)
         self.addons = QtWidgets.QListWidget()
         render = self.tools.settings["render"]["render_addon"]
-        self.addons.addItems([a for a in self.tools.addons() if a != render])
+        self.addons.addItems([a for a in self.tools.addons(self.tools.game_root) if a != render])
         self.addons.itemDoubleClicked.connect(lambda _i: self.launch())
         self.addons.currentTextChanged.connect(self.fill_maps)
         h.addWidget(self.addons, 1)
@@ -597,7 +605,7 @@ class Launcher(App):
 
     def fill_maps(self, addon):
         self.c_map.clear()
-        self.c_map.addItems([""] + self.tools.maps(addon))
+        self.c_map.addItems([""] + self.tools.maps(addon, self.tools.game_root))
 
     def new_addon(self):
         """A new addon from a base (Dota's template by default)."""
@@ -633,14 +641,10 @@ class Launcher(App):
             return None
         if not self.proton_ready():
             return None
-        if cfg:
-            exe, args = "dota2cfg.exe", ["-steam", "-dx11"]
-        else:
-            exe = "dota2.exe"
-            args = core.game_args(self.addon() if addon is None else addon,
-                                  self.c_map.currentText() if map_name is None else map_name,
-                                  self.vcon.isChecked() if addon is None else True,
-                                  self.extra.text() if extra is None else extra)
+        exe, args = core.game_command(self.tools, cfg, self.addon() if addon is None else addon,
+                                      self.c_map.currentText() if map_name is None else map_name,
+                                      self.vcon.isChecked() if addon is None else True,
+                                      self.extra.text() if extra is None else extra)
         cmd, env, cwd = core.launch_command(self.tools, exe, args)
         logf = open(self.tools.meta / "game.log", "w")
         p = subprocess.Popen(cmd, env=env, cwd=cwd, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
@@ -818,6 +822,206 @@ class Launcher(App):
                   lambda path: (path and self.log(f"installed: {path}"), self.proton_fill()))
 
     # Tools tab
+    # Builds tab: old builds of the game and the tools
+    def builds_tab(self):
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        top = QtWidgets.QHBoxLayout()
+        self.b_app = QtWidgets.QComboBox()
+        self.b_app.addItem("All apps", 0)
+        for app, a in builds.APPS.items():
+            self.b_app.addItem(f"{app} {a['name']}", app)
+        self.b_search = QtWidgets.QLineEdit()
+        self.b_search.setPlaceholderText("Search: patch, TI, date, manifest, build")
+        self.b_have = QtWidgets.QCheckBox("Downloaded only")
+        for x in (self.b_app, self.b_search, self.b_have):
+            top.addWidget(x, 1 if x is self.b_search else 0)
+        self.b_app.currentIndexChanged.connect(lambda _i: self.builds_fill())
+        self.b_search.textChanged.connect(lambda _t: self.builds_fill())
+        self.b_have.toggled.connect(lambda _c: self.builds_fill())
+        v.addLayout(top)
+        self.b_list = QtWidgets.QTreeWidget()
+        self.b_list.setHeaderLabels(["App", "Build", "Manifest", "Date (UTC)", "Remark", "Status"])
+        self.b_list.setRootIsDecorated(False)
+        self.b_list.setSortingEnabled(True)
+        self.b_list.sortByColumn(3, Qt.SortOrder.DescendingOrder)
+        self.b_list.itemDoubleClicked.connect(lambda _i, _c: self.builds_activate())
+        v.addWidget(self.b_list, 1)
+        row = QtWidgets.QHBoxLayout()
+        for text, fn in (("Download", self.builds_download), ("Make active", self.builds_activate),
+                         ("Reset to current", self.builds_reset), ("Delete", self.builds_delete),
+                         ("Open folder", self.builds_open)):
+            b = QtWidgets.QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        row.addStretch(1)
+        v.addLayout(row)
+        row = QtWidgets.QHBoxLayout()
+        for text, fn, tip in (
+                ("Copy Steam commands", self.builds_copy,
+                 "The Steam console's download_depot commands for the build's depots"),
+                ("Steam console", lambda: subprocess.Popen(["xdg-open", "steam://open/console"]), ""),
+                ("Refresh lists", self.builds_refresh, "Current manifests from Steam, patch and TI dates")):
+            b = QtWidgets.QPushButton(text)
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        row.addStretch(1)
+        v.addLayout(row)
+        f = QtWidgets.QFormLayout()
+        r, self.b_folder = path_row(str(builds.folder(self.tools)))
+        self.b_folder.textChanged.connect(lambda _t: self.builds_set_folder())
+        f.addRow("Download into", r)
+        v.addLayout(f)
+        self.b_note = QtWidgets.QLabel()
+        self.b_note.setWordWrap(True)
+        v.addWidget(self.b_note)
+        row = QtWidgets.QHBoxLayout()
+        self.b_hist = QtWidgets.QLabel()
+        row.addWidget(self.b_hist)
+        b = QtWidgets.QPushButton("Manage manifests")
+        b.clicked.connect(lambda: ManifestsDialog(self).exec())
+        row.addWidget(b)
+        row.addStretch(1)
+        v.addLayout(row)
+        try:
+            builds.record_current(self.tools)
+        except Exception as e:      # noqa: BLE001
+            self.log(f"builds: {e!r}")
+        self.builds_fill()
+        if builds.stale(self.tools):
+            def fetch():
+                try:
+                    builds.refresh(self.tools, say=lambda t: self.call(self.log, t))
+                except Exception as e:      # noqa: BLE001
+                    self.call(self.log, f"builds: {e!r}")
+                self.call(self.builds_fill)
+            threading.Thread(target=fetch, daemon=True).start()
+        return w
+
+    def builds_fill(self):
+        try:
+            rows = builds.rows(self.tools)
+        except Exception as e:      # noqa: BLE001
+            self.log(f"builds: {e!r}")
+            rows = []
+        app, text, have = self.b_app.currentData(), self.b_search.text().lower(), self.b_have.isChecked()
+        self.b_list.setSortingEnabled(False)
+        self.b_list.clear()
+        for r in rows:
+            when = time.strftime("%Y-%m-%d %H:%M", time.gmtime(r["time"]))
+            cols = [str(r["app"]), str(r["buildid"]), r["manifest"], when, r["remark"], r["status"]]
+            if (app and r["app"] != app) or (have and r["status"] in ("", "current")) \
+                    or (text and text not in " ".join(cols).lower()):
+                continue
+            it = QtWidgets.QTreeWidgetItem(cols)
+            it.setData(0, Qt.ItemDataRole.UserRole, r)
+            tip = "\n".join(f"depot {d}: {m}" for d, m in r["manifests"].items())
+            if r["missing"]:
+                tip += "\nno manifest known yet for depot " + ", ".join(map(str, r["missing"])) \
+                       + ": import its SteamDB manifests page"
+                it.setForeground(2, self.palette().brush(QtGui.QPalette.ColorGroup.Disabled,
+                                                         QtGui.QPalette.ColorRole.Text))
+            for c in range(6):
+                it.setToolTip(c, tip)
+            if r["status"] == "active" or (r["status"] == "current" and self.tools.game_root == self.tools.root):
+                f = it.font(0)
+                f.setBold(True)
+                for c in range(6):
+                    it.setFont(c, f)
+            self.b_list.addTopLevelItem(it)
+        self.b_list.setSortingEnabled(True)
+        for c in range(6):
+            self.b_list.resizeColumnToContents(c)
+        self.b_note.setText(f"Active: <b>{self.tools.game_root}</b>")
+        src = builds.sources(self.tools)
+        have = sum(1 for x in src if x["imported"])
+        self.b_hist.setText(f"Historical manifests: {have} of {len(src)} imported" if have
+                            else "For historical builds information on manifests is required")
+
+    def builds_selected(self):
+        it = self.b_list.currentItem()
+        return it.data(0, Qt.ItemDataRole.UserRole) if it else None
+
+    def builds_copy(self):
+        r = self.builds_selected()
+        if r:
+            QtWidgets.QApplication.clipboard().setText("\n".join(builds.client_commands(r)))
+            self.log(f"copied {len(r['manifests'])} download_depot commands; Steam downloads into "
+                     f"{core.client_folder(self.tools, '<depot>', r['app'])}")
+
+    def builds_set_folder(self):
+        s = self.tools.settings
+        if s["builds"]["folder"] != self.b_folder.text().strip() and self.b_folder.text().strip():
+            s["builds"]["folder"] = self.b_folder.text().strip()
+            self.tools.save_settings(s)
+            QtCore.QTimer.singleShot(0, self.builds_fill)
+
+    def builds_refresh(self):
+        self.work(lambda: builds.refresh(self.tools, say=lambda t: self.call(self.log, t)),
+                  lambda _r: self.builds_fill())
+
+    def builds_download(self):
+        r = self.builds_selected()
+        if not r:
+            return
+        if r["missing"]:
+            ans = QtWidgets.QMessageBox.question(
+                self, "Download", f"No manifest is known for depot {', '.join(map(str, r['missing']))} at this "
+                "date (import its SteamDB page). Download the rest anyway?")
+            if ans != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        runner = DDRunner(self)
+
+        def go(use_client=False):
+            def body():
+                try:
+                    builds.download(self.tools, r, ui=runner, use_client=use_client)
+                except core.NeedsClient as e:
+                    e.retry = lambda: go(True)
+                    raise
+            self.work(body, lambda _r: self.builds_fill(), notify=f"Download of {r['key']}")
+        go()
+
+    def builds_activate(self):
+        r = self.builds_selected()
+        if not r:
+            return
+        if r["status"] == "current":
+            return self.builds_reset()
+        if r["status"] not in ("downloaded", "active"):
+            QtWidgets.QMessageBox.information(self, "Builds", "Download the build first.")
+            return
+        builds.activate(self.tools, r)
+        self.builds_changed()
+
+    def builds_reset(self):
+        builds.activate(self.tools, None)
+        self.builds_changed()
+
+    def builds_changed(self):
+        self.log(f"active build: {self.tools.game_root}")
+        render = self.tools.settings["render"]["render_addon"]
+        self.addons.clear()
+        self.addons.addItems([a for a in self.tools.addons(self.tools.game_root) if a != render])
+        self.builds_fill()
+        self.refresh()
+
+    def builds_delete(self):
+        r = self.builds_selected()
+        if not r or not Path(r["path"]).exists():
+            return
+        ans = QtWidgets.QMessageBox.question(self, "Delete", f"Delete {r['path']} and everything in it?")
+        if ans == QtWidgets.QMessageBox.StandardButton.Yes:
+            builds.delete(self.tools, r)
+            self.builds_changed()
+
+    def builds_open(self):
+        r = self.builds_selected()
+        path = Path(r["path"]) if r and Path(r["path"]).exists() else builds.folder(self.tools)
+        path.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen(["xdg-open", str(path)])
+
     def tools_tab(self):
         w = QtWidgets.QWidget()
         g = QtWidgets.QGridLayout(w)
@@ -846,6 +1050,89 @@ class Launcher(App):
             QtWidgets.QMessageBox.information(self, "Steam", core.add_to_steam(self.tools))
         except SystemExit as e:
             QtWidgets.QMessageBox.warning(self, "Steam", str(e))
+
+
+class ManifestsDialog(QtWidgets.QDialog):
+    """The SteamDB pages old builds need: each depot's manifests and each
+    app's patches, whether imported, and buttons to open and import them."""
+    HINT = ("SteamDB has no API and doesn't allow scraping, and shows only the last 10 entries when signed out. "
+            "<b>Open</b> a page in your browser, sign in to SteamDB, let the full list load, save the page "
+            "(Ctrl+S), then <b>Import</b> the saved file. Imports add to what is there; nothing is removed.")
+
+    DONE = QtGui.QColor(60, 170, 80, 80)       # imported rows: translucent green, light and dark themes
+
+    class Shade(QtWidgets.QStyledItemDelegate):
+        """Imported rows' green as one band: a plain rectangle under each
+        cell (an item's own background is drawn rounded, cell by cell, by
+        styles such as Breeze)."""
+        def paint(self, painter, option, index):
+            if index.data(Qt.ItemDataRole.UserRole):
+                painter.fillRect(option.rect, ManifestsDialog.DONE)
+            super().paint(painter, option, index)
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.setWindowTitle("Manifests")
+        v = QtWidgets.QVBoxLayout(self)
+        hint = QtWidgets.QLabel(self.HINT)
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+        self.table = QtWidgets.QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Source", "Imported", "Last Updated", ""])
+        self.table.verticalHeader().hide()
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.table.setShowGrid(False)
+        self.table.setItemDelegate(self.Shade(self.table))
+        v.addWidget(self.table, 1)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+        self.fill()
+        self.resize(760, 640)
+
+    def fill(self):
+        src = builds.sources(self.app.tools)
+        self.table.setRowCount(len(src))
+        for i, x in enumerate(src):
+            item = QtWidgets.QTableWidgetItem(x["label"])
+            item.setToolTip(f"{x['url']}\n{x['entries']} entries known")
+            self.table.setItem(i, 0, item)
+            self.table.setItem(i, 1, QtWidgets.QTableWidgetItem("yes" if x["imported"] else "no"))
+            self.table.setItem(i, 2, QtWidgets.QTableWidgetItem(
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(x["imported"])) if x["imported"] else ""))
+            opn = QtWidgets.QPushButton("Open")
+            opn.clicked.connect(lambda _c=False, u=x["url"]: subprocess.Popen(["xdg-open", u]))
+            imp = QtWidgets.QPushButton("Import")
+            imp.clicked.connect(lambda _c=False, x=x: self.do_import(x))
+            self.table.setCellWidget(i, 3, Launcher.row(opn, imp))
+            self.table.setItem(i, 3, QtWidgets.QTableWidgetItem())
+            for c in range(4):
+                self.table.item(i, c).setData(Qt.ItemDataRole.UserRole, bool(x["imported"]))
+        self.table.resizeColumnsToContents()
+        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+
+    def do_import(self, x):
+        name, _ = QtWidgets.QFileDialog.getOpenFileName(self, f"Saved SteamDB page: {x['label']}",
+                                                        str(Path.home() / "Downloads"),
+                                                        "Web pages (*.html *.htm *.txt);;All files (*)")
+        if not name:
+            return
+        data = Path(name).read_bytes()
+        if data[:2] == b"\x1f\x8b":
+            data = gzip.decompress(data)
+        text = data.decode("utf-8", "replace")
+        found = builds.page_source(text)
+        if found and found != (x["kind"], x["id"]):
+            QtWidgets.QMessageBox.warning(self, "Import", f"{Path(name).name} is the page of {found[0]} {found[1]}, "
+                                          f"not of {x['kind']} {x['id']}: imported as what it is.")
+        kw = {} if found else {x["kind"]: x["id"]}
+        kind, ident, n = builds.import_page(self.app.tools, text, **kw)
+        self.app.log(f"{Path(name).name}: {n} entries for {kind} {ident}")
+        self.fill()
+        self.app.builds_fill()
 
 
 class NewAddonDialog(QtWidgets.QDialog):

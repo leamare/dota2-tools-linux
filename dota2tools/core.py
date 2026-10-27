@@ -64,6 +64,10 @@ DEFAULT_SETTINGS = {
     "terminal": "",
     "launch": {"addon": "", "map": "", "vconsole": True, "extra": "", "tray": True,
                "vconsole_terminal": False},
+    # Old builds (builds.py): where they are downloaded, the one the launcher
+    # starts (empty: the tools folder, the current build), and the depots of
+    # each app a build is downloaded with (empty: builds.APPS's).
+    "builds": {"folder": str(DEFAULT_DIR.parent / "dota2-builds"), "active": "", "depots": {}},
     "render": {"render_addon": "dota2tools_render", "overlap": 0.15,
                # The full picture: a square, sized and placed as devilesk's
                # dota-interactive-map has it -- from its src/js/mapConstants.js
@@ -373,19 +377,28 @@ class Tools:
         tgt, state = self.target(), self.state
         return tgt, state, state.get("buildid") == tgt["buildid"] and state.get("manifests") == tgt["manifests"]
 
-    def addons(self):
-        """The addons both clients see (native game/ and content/ dota_addons)."""
+    @property
+    def game_root(self):
+        """The game the launcher starts: the active old build (builds.py),
+        else the tools folder."""
+        active = self.settings.get("builds", {}).get("active", "")
+        return Path(active) if active and Path(active).is_dir() else self.root
+
+    def addons(self, root=None):
+        """The addons both clients see (native game/ and content/ dota_addons),
+        or those of another build's folder."""
         names = set()
         for rel in SHARED_DIRS:
-            d = self.root / rel
+            d = Path(root or self.root) / rel
             if d.is_dir():
                 names |= {p.name for p in d.iterdir() if p.is_dir() and not p.name.startswith(".")}
         return sorted(names - NOT_ADDONS)
 
-    def maps(self, addon=""):
+    def maps(self, addon="", root=None):
         """Maps of the addon (game/dota_addons/<addon>/maps), else the base
         game's (game/dota/maps)."""
-        d = (self.root / "game" / "dota_addons" / addon / "maps") if addon else (self.root / "game" / "dota" / "maps")
+        root = Path(root or self.root)
+        d = (root / "game" / "dota_addons" / addon / "maps") if addon else (root / "game" / "dota" / "maps")
         return sorted(p.stem for p in d.glob("*.vpk")) if d.is_dir() else []
 
 
@@ -505,21 +518,21 @@ class TerminalUI:
         return subprocess.call(cmd)
 
 
-def client_folder(tools, depot):
+def client_folder(tools, depot, app=APP):
     """Where the Steam client's console command download_depot puts a depot."""
-    return tools.steam / "ubuntu12_32" / "steamapps" / "content" / f"app_{APP}" / f"depot_{depot}"
+    return tools.steam / "ubuntu12_32" / "steamapps" / "content" / f"app_{app}" / f"depot_{depot}"
 
 
-def client_command(depot, manifest):
-    return f"download_depot {APP} {depot} {manifest}"
+def client_command(depot, manifest, app=APP):
+    return f"download_depot {app} {depot} {manifest}"
 
 
 class NeedsClient(Exception):
-    """The tools DLC depot has to come from the Steam client's console."""
-    def __init__(self, depot, manifest, folder):
+    """A depot that has to come from the Steam client's console."""
+    def __init__(self, depot, manifest, folder, app=APP, again="update again"):
         super().__init__(f"run in the Steam client's console (steam://open/console):\n  "
-                         f"{client_command(depot, manifest)}\nwait for 'Depot download complete', then update again")
-        self.command = client_command(depot, manifest)
+                         f"{client_command(depot, manifest, app)}\nwait for 'Depot download complete', then {again}")
+        self.command = client_command(depot, manifest, app)
         self.folder = folder
 
 
@@ -772,24 +785,41 @@ def proton_script(tools):
 
 def launch_command(tools, exe="dota2.exe", args=()):
     """(command, environment, working folder) running a Windows program of
-    the tools through Proton, in the Steam Linux Runtime unless turned off."""
+    the tools (or of the active old build) through Proton, in the Steam
+    Linux Runtime unless turned off."""
     s = tools.settings
     steam = tools.steam
     prefix = tools.meta / "prefix"
     prefix.mkdir(parents=True, exist_ok=True)
     native = tools.state.get("native", "")
+    root = tools.game_root
+    bindir = root / "game" / "bin" / "win64"
+    if not (bindir / exe).exists() and (root / exe).exists():
+        bindir = root                   # a Source 1 build: dota.exe at the top
     env = dict(os.environ,
                STEAM_COMPAT_CLIENT_INSTALL_PATH=str(steam),
                STEAM_COMPAT_DATA_PATH=str(prefix),
-               STEAM_COMPAT_INSTALL_PATH=str(tools.root),
+               STEAM_COMPAT_INSTALL_PATH=str(root),
                STEAM_COMPAT_APP_ID=str(APP), SteamAppId=str(APP), SteamGameId=str(APP),
-               STEAM_COMPAT_MOUNTS=":".join(p for p in (str(tools.root), native) if p))
+               STEAM_COMPAT_MOUNTS=":".join(dict.fromkeys(p for p in (str(tools.root), str(root), native) if p)))
     from . import proton
-    cmd = [proton_script(tools), "waitforexitandrun", str(tools.win64 / exe)] + list(args)
+    cmd = [proton_script(tools), "waitforexitandrun", str(bindir / exe)] + list(args)
     sniper = proton.runtime_entry(steam)
     if sniper and s.get("container", True):
         cmd = [str(sniper), "--verb=waitforexitandrun", "--"] + cmd
-    return cmd, env, str(tools.win64)
+    return cmd, env, str(bindir)
+
+
+def game_command(tools, cfg=False, addon="", map_name="", vconsole=True, extra=""):
+    """(exe, arguments) for the launcher's Launch: the tools on an addon, or
+    Dota's tools launcher (cfg); for an active Source 1 build, its game."""
+    root = tools.game_root
+    if root != tools.root and not (root / "game" / "bin" / "win64" / "dota2.exe").exists():
+        exe = "dota.exe" if (root / "dota.exe").exists() else "dota2.exe"
+        return exe, ["-steam", "-console", "-novid"] + extra.split()
+    if cfg:
+        return "dota2cfg.exe", ["-steam", "-dx11"] + extra.split()
+    return "dota2.exe", game_args(addon, map_name, vconsole, extra)
 
 
 def open_vconsole(tools, port=29000):
