@@ -153,4 +153,3 @@ Custom lighting (sun direction, shadow strength) renders a relit copy of the map
 pip install python-appimage
 packaging/appimage/build.sh          # Dota2-Workshop-Tools-x86_64.AppImage in the current folder
 ```
-

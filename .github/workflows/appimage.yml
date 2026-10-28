@@ -1,11 +1,10 @@
 name: AppImage
 
-# Builds the AppImage on every push to main and on pull requests (kept as a
-# workflow artifact), and attaches it to a GitHub release for tags v*.
+# Builds the AppImage on every push to master and on pull requests
 on:
   push:
-    branches: [main]
-    tags: ["v*"]
+    branches: [master, main]
+    tags: ["[0-9]*", "v[0-9]*"]
   pull_request:
   workflow_dispatch:
 
@@ -30,7 +29,6 @@ jobs:
       - name: Build
         run: |
           pip install python-appimage
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then export VERSION="${GITHUB_REF_NAME#v}"; fi
           packaging/appimage/build.sh
 
       - name: Smoke test
@@ -51,7 +49,7 @@ jobs:
           path: Dota2-Workshop-Tools*.AppImage
 
       - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: Dota2-Workshop-Tools*.AppImage
