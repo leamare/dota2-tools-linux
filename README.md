@@ -119,7 +119,7 @@ This allows downloading older versions of the client and working with them if ne
 Switching builds:
 
 - **Make active** makes the launcher start that build instead of the tools folder. A Source 1 build starts its game (`dota.exe -console`).
-- **Reset to current** goes back to the tools folder, the current build linked from your native install.
+- **Reset to latest** goes back to the tools folder: the latest build, Steam's, linked from your native install.
 
 ## Map renderer
 

@@ -529,6 +529,14 @@ class Launcher(App):
         except Exception as e:      # noqa: BLE001
             self.status.setText(f"Cannot read Steam's data: {e}")
             return
+        # Steam's current manifests into the builds list, and the list anew:
+        # an update changes which build is the latest.
+        try:
+            builds.record_current(self.tools)
+        except Exception as e:      # noqa: BLE001
+            self.log(f"builds: {e!r}")
+        if hasattr(self, "b_list"):
+            self.builds_fill()
         text = f"Dota 2 build {tgt['buildid']}  ·  tools build {state.get('buildid', 'none')}  ·  "
         if self.tools.game_root != self.tools.root:
             text = f"<b>Old build active: {self.tools.game_root.name}</b>  ·  " + text
@@ -561,7 +569,9 @@ class Launcher(App):
         b.clicked.connect(lambda: self.launch())
         side.addWidget(b)
         f = QtWidgets.QFormLayout()
+        f.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.c_map = QtWidgets.QComboBox()
+        self.c_map.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
         f.addRow("Start on map", self.c_map)
         self.vcon = QtWidgets.QCheckBox("VConsole")
         self.vcon.setChecked(s.get("vconsole", True))
@@ -849,7 +859,7 @@ class Launcher(App):
         v.addWidget(self.b_list, 1)
         row = QtWidgets.QHBoxLayout()
         for text, fn in (("Download", self.builds_download), ("Make active", self.builds_activate),
-                         ("Reset to current", self.builds_reset), ("Delete", self.builds_delete),
+                         ("Reset to latest", self.builds_reset), ("Delete", self.builds_delete),
                          ("Open folder", self.builds_open)):
             b = QtWidgets.QPushButton(text)
             b.clicked.connect(fn)
@@ -884,10 +894,6 @@ class Launcher(App):
         row.addWidget(b)
         row.addStretch(1)
         v.addLayout(row)
-        try:
-            builds.record_current(self.tools)
-        except Exception as e:      # noqa: BLE001
-            self.log(f"builds: {e!r}")
         self.builds_fill()
         if builds.stale(self.tools):
             def fetch():
@@ -911,7 +917,7 @@ class Launcher(App):
         for r in rows:
             when = time.strftime("%Y-%m-%d %H:%M", time.gmtime(r["time"]))
             cols = [str(r["app"]), str(r["buildid"]), r["manifest"], when, r["remark"], r["status"]]
-            if (app and r["app"] != app) or (have and r["status"] in ("", "current")) \
+            if (app and r["app"] != app) or (have and not ("downloaded" in r["status"] or r["status"] == "active")) \
                     or (text and text not in " ".join(cols).lower()):
                 continue
             it = QtWidgets.QTreeWidgetItem(cols)
@@ -924,7 +930,7 @@ class Launcher(App):
                                                          QtGui.QPalette.ColorRole.Text))
             for c in range(6):
                 it.setToolTip(c, tip)
-            if r["status"] == "active" or (r["status"] == "current" and self.tools.game_root == self.tools.root):
+            if "active" in r["status"]:
                 f = it.font(0)
                 f.setBold(True)
                 for c in range(6):
@@ -947,8 +953,8 @@ class Launcher(App):
         r = self.builds_selected()
         if r:
             QtWidgets.QApplication.clipboard().setText("\n".join(builds.client_commands(r)))
-            self.log(f"copied {len(r['manifests'])} download_depot commands; Steam downloads into "
-                     f"{core.client_folder(self.tools, '<depot>', r['app'])}")
+            self.log(f"copied {len(r['manifests'])} download_depot commands: paste them into Steam's console, "
+                     "wait for each “Depot download complete”, then Download")
 
     def builds_set_folder(self):
         s = self.tools.settings
@@ -987,7 +993,7 @@ class Launcher(App):
         r = self.builds_selected()
         if not r:
             return
-        if r["status"] == "current":
+        if r["status"].startswith("latest"):
             return self.builds_reset()
         if r["status"] not in ("downloaded", "active"):
             QtWidgets.QMessageBox.information(self, "Builds", "Download the build first.")
@@ -1276,7 +1282,13 @@ class SettingsDialog(QtWidgets.QDialog):
 def main(tools):
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     app.setApplicationName("dota2-tools")
-    app.setDesktopFileName("dota2-workshop-tools")
+    if core.DESKTOP.exists():       # else the desktop portal complains it doesn't know the app
+        app.setDesktopFileName(core.DESKTOP.stem)
     win = Launcher(tools) if tools.installed else Installer(tools)
     win.show()
-    return app.exec()
+    rc = app.exec()
+    # Out without PySide's teardown, which can delete a window's objects
+    # twice and crash (seen as a segfault on closing, after the installer).
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(rc)

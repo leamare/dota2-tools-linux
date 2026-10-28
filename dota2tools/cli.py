@@ -78,7 +78,7 @@ def cmd_launch(tools, args, extra):
     if proton.problems(tools):
         return 1
     if tools.game_root != tools.root:
-        print(f"the active build: {tools.game_root} (dota2-tools builds reset: back to the current one)")
+        print(f"the active build: {tools.game_root} (dota2-tools builds reset: back to the latest)")
     elif not args.no_update and s.get("auto_update", True):
         try:
             if core.update(tools, if_needed=True):

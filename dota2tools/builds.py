@@ -318,11 +318,20 @@ def rows(tools):
     """Every known build, newest first: [{key, app, time, manifests {depot:
     manifest}, missing [depots], buildid, remark, status, path}]. A build
     is a manifest of the app's primary depot; each other depot takes the
-    manifest it had then."""
+    manifest it had then.
+
+    status: "latest" for the tools folder's build (Steam's, which the
+    tools folder follows; "latest, active" while the launcher starts it),
+    "active" for the old build the launcher starts instead, "downloaded",
+    "partial", or empty."""
     d = load(tools)
     base = folder(tools)
-    active = tools.settings["builds"].get("active", "")
-    current = tools.state.get("buildid", "")
+    root = tools.game_root
+    active = str(root) if root != tools.root else ""
+    # The tools folder's build: the newest whose Windows depots are at the
+    # manifests it was last updated to.
+    have = tools.state.get("manifests", {})
+    latest = None
     out = []
     for app, a in APPS.items():
         hist = {dep: sorted((t, m) for m, t in d["depots"].get(str(dep), {}).get("manifests", {}).items())
@@ -343,11 +352,15 @@ def rows(tools):
             got = [dep for dep, m in mans.items() if done.get(str(dep)) == m]
             status = ("active" if str(path) == active else "downloaded") if mans and len(got) == len(mans) \
                 else "partial" if got else ""
-            if not status and app == core.APP and near and str(near[0]) == str(current):
-                status = "current"      # the tools folder's own build
+            if app == core.APP and have and all(str(mans.get(int(dep))) == m for dep, m in have.items()) \
+                    and (latest is None or t > latest[0]):
+                latest = (t, len(out))
             out.append({"key": key, "app": app, "time": t, "manifest": manifest, "manifests": mans,
                         "missing": missing, "buildid": near[0] if near else "", "remark": remark(d["meta"], t),
                         "status": status, "path": str(path)})
+    if latest:
+        r = out[latest[1]]
+        r["status"] = "latest" + (", active" if not active else "") + (f"; {r['status']}" if r["status"] else "")
     return sorted(out, key=lambda r: -r["time"])
 
 
@@ -373,18 +386,20 @@ def needs_login(app, depot):
 def _import_client(tools, app, depot, manifest, path, ui):
     """A depot the running Steam client downloaded (download_depot in its
     console), moved into the build's folder."""
-    src = core.client_folder(tools, depot, app)
     marker = tools.meta / f"client_build_{depot}.json"
-    if not src.exists() or _read(marker).get("manifest") != manifest:
+    src = core.client_ready(tools, depot, manifest, app, asked=_read(marker).get("manifest"))
+    if src is None:
         tools.save(marker, {"manifest": manifest})
-        raise core.NeedsClient(depot, manifest, src, app, again="download the build again")
+        raise core.NeedsClient(depot, manifest, core.client_folder(tools, depot, app), app,
+                               again="download the build again")
     for dirpath, _, names in os.walk(src):
         for name in names:
             dst = path / os.path.relpath(os.path.join(dirpath, name), src)
             dst.parent.mkdir(parents=True, exist_ok=True)
             os.replace(os.path.join(dirpath, name), dst)
     shutil.rmtree(src, ignore_errors=True)
-    marker.unlink()
+    if marker.exists():
+        marker.unlink()
     ui.say(f"imported depot {depot} from the Steam client")
 
 
@@ -432,7 +447,8 @@ def download(tools, row, ui=None, qr=False, password=None, use_client=False):
 
 def client_commands(row):
     """The Steam client console's commands downloading the build's depots
-    (into Steam's ubuntu12_32/steamapps/content/app_<app>/)."""
+    (into steamapps/content/app_<app>/ beside the client's binaries:
+    ubuntu12_32, or steamrt64 for the 64-bit client)."""
     return [core.client_command(depot, manifest, row["app"]) for depot, manifest in row["manifests"].items()]
 
 

@@ -518,9 +518,24 @@ class TerminalUI:
         return subprocess.call(cmd)
 
 
+# Where the Steam client's download_depot puts a depot: steamapps/content
+# beside the client's binaries (ubuntu12_32; steamrt64 for the 64-bit
+# client; the others in case), or Steam's own steamapps.
+CLIENT_DIRS = ["steamrt64", "steamrt32", "ubuntu12_64", "ubuntu12_32", ""]
+
+
 def client_folder(tools, depot, app=APP):
-    """Where the Steam client's console command download_depot puts a depot."""
-    return tools.steam / "ubuntu12_32" / "steamapps" / "content" / f"app_{app}" / f"depot_{depot}"
+    """Where the Steam client's console command download_depot put a depot:
+    the first of the client's folders that has it, else the 32-bit client's."""
+    places = [tools.steam / d / "steamapps" / "content" / f"app_{app}" / f"depot_{depot}" for d in CLIENT_DIRS]
+    return next((f for f in places if f.is_dir()), places[CLIENT_DIRS.index("ubuntu12_32")])
+
+
+def client_ready(tools, depot, manifest, app=APP, asked=None):
+    """The folder of a finished download_depot of this manifest, or None:
+    the download is there and that manifest is the one asked for (`asked`)."""
+    folder = client_folder(tools, depot, app)
+    return folder if folder.is_dir() and asked == str(manifest) else None
 
 
 def client_command(depot, manifest, app=APP):
@@ -541,12 +556,11 @@ def import_client(tools, depot, manifest, state, ui):
     own): moved into the tools folder, and the files of the depot's previous
     version that this one no longer has removed. The download is used once,
     for the manifest it was asked for, then deleted."""
-    src = client_folder(tools, depot)
     marker = tools.meta / f"client_{depot}.json"
-    asked = tools.load(marker, {}).get("manifest")
-    if not src.exists() or asked != manifest:
+    src = client_ready(tools, depot, manifest, asked=tools.load(marker, {}).get("manifest"))
+    if src is None:
         tools.save(marker, {"manifest": manifest})
-        raise NeedsClient(depot, manifest, src)
+        raise NeedsClient(depot, manifest, client_folder(tools, depot))
     files = []
     for dirpath, _, names in os.walk(src):
         for name in names:
@@ -563,7 +577,8 @@ def import_client(tools, depot, manifest, state, ui):
         if p.is_file() and not p.is_symlink():
             p.unlink()
     shutil.rmtree(src, ignore_errors=True)
-    marker.unlink()
+    if marker.exists():
+        marker.unlink()
     state.setdefault("client_files", {})[str(depot)] = sorted(files)
     ui.say(f"imported depot {depot} from the Steam client: {len(files)} files, {len(old)} removed")
 
