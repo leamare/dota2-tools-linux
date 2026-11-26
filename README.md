@@ -143,9 +143,15 @@ The outputs:
 - `tools_materials` hides tools-only materials, such as the walkable-area grid under bridges;
 - `edge_trees` gives the black silhouette trees beyond the map's edge their leaves;
 - `corners` puts ground on the black fields in the corners, baked from the map's own edge materials;
-- `lava` restores the Dire lava's glow.
+- `lava` restores the Dire lava's glow;
+- `dire_lava_corner` joins the Dire base's two lava channels round its corner (dota), with a rim of crust and dark rock fading into the ground;
+- `fountain` hides the lotus pool's ambient water, which draws as a cyan blot at mid in a top-down render;
+- `riverbed` puts mid's stray Radiant riverbed tile on the Dire riverbed material, leaving its stairs Radiant;
+- `dire_base_tiles` (not on by default) draws the Dire base from one tile grid layer, removing the seam left of the fountain; it also changes that area's trees and props.
 
-Custom lighting (sun direction, shadow strength) renders a relit copy of the map built from its source. Scale 2 or 0.5 changes only the export resolution.
+Some scripts change the map's source, not only its compiled resources. The map is then rebuilt from its source once, with every such change and the custom sun, and cached in `.dota2_tools/cache/rebuilt` until the source or the changes differ. Its compile uses the real display and GPU: on the software renderer its light baking never finishes.
+
+Custom lighting (sun direction, shadow strength) renders that rebuilt copy with its sun turned. Scale 2 or 0.5 changes only the export resolution.
 
 ## Building the AppImage
 

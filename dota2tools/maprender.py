@@ -14,7 +14,7 @@ Steps (the launcher's Map renderer window does all but the SFM clicks):
      mirrors the chosen addon (its maps and assets, linked) or stands alone for
      the base game's maps; the pre-run scripts (render.prerun in the settings,
      default builtin:flies, builtin:tools_materials, builtin:edge_trees,
-     builtin:corners, builtin:lava) write and compile
+     builtin:corners, builtin:lava, builtin:fountain, builtin:riverbed) write and compile
      material overrides and models into it; the session, with those models in
      its scene, goes to its elements/sessions.
   2. launch the tools on the render addon, Tools -> Source Filmmaker, File ->
@@ -167,17 +167,20 @@ def render_convars(tools, addon="", map_name=""):
 
 
 def render_scale(tools):
-    """Pixels per unit against the default render: 0.5, 1 or 2."""
+    """Pixels per unit against the default render: 0.25, 0.5, 1 or 2."""
     try:
         return float(tools.settings["render"].get("scale", 1.0)) or 1.0
     except (TypeError, ValueError):
         return 1.0
 
 
-def session_text(map_name, frames_dir, rect, overlap=0.15, models=(), shadows=True, repeat=2):
+def session_text(map_name, frames_dir, rect, overlap=0.15, models=(), shadows=True, repeat=2,
+                 size=(FRAME_W, FRAME_H)):
     """The SFM session (KeyValues2 text) for the map: its camera grid, the
     export folder (a Linux path, as Wine sees it), the shot's length, and
-    the pre-run scripts' models ([(vmdl, name, position)]) in its scene."""
+    the pre-run scripts' models ([(vmdl, name, position)]) in its scene.
+    `size` is the movie export resolution (must match what Export Movie uses,
+    including 0.25× / 0.5× quick tests)."""
     s = TEMPLATE.read_text(encoding="utf-8")
     centres, nx, ny = grid(rect, overlap)
     # The first position twice: SFM writes the first frame before the
@@ -192,6 +195,17 @@ def session_text(map_name, frames_dir, rect, overlap=0.15, models=(), shadows=Tr
     path = core.winpath(Path(frames_dir)).rstrip("\\") + "\\"
     s = s.replace('"FRAMES_DIR"', '"' + path.replace("\\", "\\\\") + '"')
     s = s.replace("-0.4964516461 0.5035233498 0.5035233498 0.4964516461", " ".join(f"{q:.10f}" for q in QUAT))
+    # renderSettings + movieSettings must both match the export size. Leaving
+    # them at 3840×2160 while Export Movie ran at 960×540 left the layoff
+    # buffer ghosting previous camera positions into every low-res frame.
+    w, h = int(size[0]), int(size[1])
+    for block in ('"name" "string" "renderSettings"', '"name" "string" "movieSettings"'):
+        i = s.find(block)
+        if i < 0:
+            raise SystemExit(f"session template missing {block}")
+        s = (s[:i]
+             + s[i:].replace('"width" "int" "3840"', f'"width" "int" "{w}"', 1)
+                    .replace('"height" "int" "2160"', f'"height" "int" "{h}"', 1))
     pos = '"name" "string" "transform_pos"'
     # Each position held from 0.4 s before its frame to 0.4 s after: SFM's
     # motion blur samples the camera over the shutter, and a camera still
@@ -277,6 +291,34 @@ class Context:
         self.game, self.content = render_paths(tools, render_addon)
         self.options, self.log = options, log
         self.models = []
+        self.map_edits = {}
+        self.map_renames = []
+        self.source_edits = []
+
+    def edit_source(self, name, edit, files=()):
+        """An edit of the map's source, for the copy rebuilt from it:
+        edit(text) -> text on the map's vmap as KeyValues2 text. files:
+        [(content path, KeyValues2 text)] written into the render addon's
+        content as binary vmaps first (tile sets, prefabs the edit points
+        at). The map is rebuilt once with every script's edits (and the
+        render's sun); `name` keys the cache."""
+        self.source_edits.append((name, edit, list(files)))
+
+    def edit_map(self, rel, replacements):
+        """Byte replacements applied to the render-only copy of a map resource."""
+        self.map_edits.setdefault(rel, []).extend(replacements)
+
+    def rename_in_map(self, rel, old, new):
+        """A same-length string (a material's name, say) replaced everywhere
+        in a map resource: in its plain blocks and inside its compressed KV3
+        ones (a model's draw calls name their material in MDAT, which a
+        byte replacement doesn't reach)."""
+        from . import mapinfo
+        if mapinfo.read(self.tools, self.addon, self.map, rel) is None:
+            raise SystemExit(f"{rel}: not in the map")
+        # Applied to the package actually patched (the map, or its copy
+        # rebuilt from source), when the session's map is written.
+        self.map_renames.append((rel, old, new))
 
     def add_model(self, vmdl, name=None, position=(0, 0, 0)):
         """A model (models/....vmdl: the render addon's or the game's) put in
@@ -345,11 +387,18 @@ class Context:
         vmat = out or vmat
         if not m:
             raise SystemExit(f"{vmat}: not in the map or the game")
+        if source is None and not m["shader"]:
+            raise SystemExit(f"{vmat}: read back empty -- source2viewer-cli too old for the game's resources?")
         names = {g: mapinfo.source_name(m["vectors"], g) for g in m["textures"]}
         for _ in range(4):
             textures = {}
             for g, vtex in m["textures"].items():
-                stem = Path(vtex).name.split("_psd_")[0].split("_vmat_")[0].split(".")[0]
+                stem = Path(vtex).stem
+                # An edited texture is written under the material's own name:
+                # two overrides of one texture (kept and hidden copies, say)
+                # must not overwrite each other's image.
+                if edits and names[g] in edits:
+                    stem = f"{stem}_{Path(vmat).stem}"
                 rel = self.dota_texture(vtex, f"materials/dota2tools/textures/{stem}.png", alpha=True)
                 if "TintMask" in names[g]:
                     # Compiled, a mask sits in whichever channel the format
@@ -486,73 +535,99 @@ def map_source(tools, addon, map_name):
     return p if p.exists() else None
 
 
-def relit_map(tools, addon, map_name, game, content, sun, log=print, progress=no_progress):
-    """A copy of the map with its sun at `sun` (pitch, yaw) compiled into the
-    render addon (game, content): its source converted to text, the global
-    light's angles and every ent_dota_lightinfo's light direction changed,
-    converted back and compiled there. The map and its addon stay as they
-    are. Kept in the tools' cache by the source and the angles. False when
-    the map has no source."""
+def vmap_text(tools, path):
+    """A vmap (binary or text) as KeyValues2 text."""
+    import tempfile
+    with tempfile.TemporaryDirectory(dir=tools.meta) as d:
+        out = Path(d) / "text.vmap"
+        rc, _msg = core.proton_run(tools, "dmxconvert.exe", ["-i", core.winpath(path), "-o", core.winpath(out),
+                                                             "-oe", "keyvalues2"])
+        if rc != 0 or not out.exists():
+            raise SystemExit(f"dmxconvert could not read {path} (rc {rc})")
+        return out.read_bytes().decode("utf-8", "surrogateescape")
+
+
+def write_vmap(tools, text, path):
+    """KeyValues2 text written as a binary vmap at `path`."""
+    import tempfile
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=tools.meta) as d:
+        src = Path(d) / "text.vmap"
+        src.write_bytes(text.encode("utf-8", "surrogateescape"))
+        if path.exists():
+            path.unlink()
+        rc, _msg = core.proton_run(tools, "dmxconvert.exe", ["-i", core.winpath(src), "-o", core.winpath(path),
+                                                             "-oe", "binary"])
+    if rc != 0 or not path.exists():
+        raise SystemExit(f"dmxconvert could not write {path} (rc {rc})")
+
+
+def sun_edit(sun):
+    """The source edit putting the sun at `sun` (pitch, yaw): the global
+    light's angles and every ent_dota_lightinfo's light direction."""
+    angles = f"{sun[0]:g} {sun[1]:g} 0"
+
+    def edit(t):
+        blocks, n = t.split('"CMapEntity"'), 0
+        for i, b in enumerate(blocks):
+            if '"classname" "string" "env_global_light"' in b:
+                blocks[i] = re.sub(r'("angles" "string" )"[^"]*"', lambda m: f'{m.group(1)}"{angles}"', b, count=1)
+                n += 1
+            elif '"classname" "string" "ent_dota_lightinfo"' in b:
+                blocks[i] = re.sub(r'("light_direction_(?:day|night)" "string" )"[^"]*"',
+                                   lambda m: f'{m.group(1)}"{angles}"', b)
+                n += 1
+        if not n:
+            raise SystemExit("the map's source has no global light")
+        return '"CMapEntity"'.join(blocks)
+    return edit
+
+
+def rebuilt_map(tools, addon, map_name, game, content, edits, log=print, progress=no_progress):
+    """A copy of the map rebuilt from its source with `edits` ([(name,
+    edit(text) -> text, [(content path, text)])]: the sun, pre-run scripts'
+    source edits) and compiled into the render addon (game, content), as
+    maps/<map>.vpk. The map and its addon stay as they are. Kept in the
+    tools' cache by the source and the edits' names. False when the map
+    has no source."""
     import hashlib
     src = map_source(tools, addon, map_name)
     if not src:
-        log(f"sun: {map_name} has no source (maps/{map_name}.vmap) to rebuild: its own sun stays")
+        log(f"map: {map_name} has no source (maps/{map_name}.vmap) to rebuild: source edits skipped")
         return False
     st = src.stat()
-    key = hashlib.sha1(f"{src}|{st.st_size}|{st.st_mtime_ns}|{sun[0]:g}|{sun[1]:g}".encode()).hexdigest()[:16]
-    cache = tools.meta / "cache" / "relit" / f"{addon or 'dota'}_{map_name}_{key}.vpk"
+    names = "|".join(name for name, _e, _f in edits)
+    key = hashlib.sha1(f"{src}|{st.st_size}|{st.st_mtime_ns}|{names}".encode()).hexdigest()[:16]
+    cache = tools.meta / "cache" / "rebuilt" / f"{addon or 'dota'}_{map_name}_{key}.vpk"
     out = unshadow(game, f"maps/{map_name}.vpk")
     if out.exists():
         out.unlink()
     out.parent.mkdir(parents=True, exist_ok=True)
     if cache.exists():
         shutil.copy2(cache, out)
-        log(f"sun: {map_name} at pitch {sun[0]:g}, yaw {sun[1]:g} (rebuilt before)")
+        log(f"map: {map_name} rebuilt before ({names})")
         return True
-    log(f"sun: rebuilding a copy of {map_name} with its sun at pitch {sun[0]:g}, yaw {sun[1]:g} "
-        f"(a few minutes; once per source and angles)")
-    work = content / "maps"
-    work.mkdir(parents=True, exist_ok=True)
-    text_in, text_out, vmap = work / f"{map_name}_text.vmap", work / f"{map_name}_relit_text.vmap", \
-        work / f"{map_name}.vmap"
-    progress("sun: the map's source as text", 0.0)
-    rc, msg = core.proton_run(tools, "dmxconvert.exe", ["-i", core.winpath(src), "-o", core.winpath(text_in),
-                                                        "-oe", "keyvalues2"])
-    if rc != 0 or not text_in.exists():
-        raise SystemExit(f"dmxconvert could not read {src} (rc {rc})")
-    t = text_in.read_text(encoding="utf-8", errors="surrogateescape")
-    angles = f"{sun[0]:g} {sun[1]:g} 0"
-    blocks, n = t.split('"CMapEntity"'), 0
-    for i, b in enumerate(blocks):
-        if '"classname" "string" "env_global_light"' in b:
-            b = re.sub(r'("angles" "string" )"[^"]*"', lambda m: f'{m.group(1)}"{angles}"', b, count=1)
-            blocks[i] = b
-            n += 1
-        elif '"classname" "string" "ent_dota_lightinfo"' in b:
-            b = re.sub(r'("light_direction_(?:day|night)" "string" )"[^"]*"', lambda m: f'{m.group(1)}"{angles}"', b)
-            blocks[i] = b
-            n += 1
-    if not n:
-        log(f"sun: {map_name}'s source has no global light: its own sun stays")
-        text_in.unlink()
-        return False
-    text_out.write_text('"CMapEntity"'.join(blocks), encoding="utf-8", errors="surrogateescape")
-    text_in.unlink()
-    progress("sun: back to the map's format", 0.3)
-    rc, msg = core.proton_run(tools, "dmxconvert.exe", ["-i", core.winpath(text_out), "-o", core.winpath(vmap),
-                                                        "-oe", "binary"])
-    text_out.unlink()
-    if rc != 0 or not vmap.exists():
-        raise SystemExit(f"dmxconvert could not write the relit map (rc {rc})")
-    progress("sun: compiling the copy", 0.5)
-    ok, msg = core.resource_compile(tools, vmap)
+    log(f"map: rebuilding a copy of {map_name} from its source ({names}; a few minutes, once per source "
+        f"and edits)")
+    progress("map: its source as text", 0.0)
+    t = vmap_text(tools, src)
+    for name, edit, files in edits:
+        for rel, text in files:
+            write_vmap(tools, text, content / rel)
+        t = edit(t)
+    progress("map: back to the map's format", 0.3)
+    vmap = content / "maps" / f"{map_name}.vmap"
+    write_vmap(tools, t, vmap)
+    progress("map: compiling the copy", 0.5)
+    ok, msg = core.resource_compile(tools, vmap, gpu=True)
     if not ok or not out.exists():
-        raise SystemExit("resourcecompiler failed on the relit map:\n" + "\n".join(msg.splitlines()[-15:]))
+        raise SystemExit("resourcecompiler failed on the rebuilt map:\n" + "\n".join(msg.splitlines()[-15:]))
     cache.parent.mkdir(parents=True, exist_ok=True)
     for old in cache.parent.glob(f"{addon or 'dota'}_{map_name}_*.vpk"):
         old.unlink()
     shutil.copy2(out, cache)
-    log(f"sun: {map_name} rebuilt with its sun at pitch {sun[0]:g}, yaw {sun[1]:g}")
+    log(f"map: {map_name} rebuilt ({names})")
     return True
 
 
@@ -565,10 +640,8 @@ def prepare(tools, addon, map_name, frames_dir, rect=None, log=print, progress=n
     progress("the render addon", 0.0)
     game, content = prepare_addon(tools, addon, name, log)
     sun = sun_override(tools)
-    if sun:
-        relit_map(tools, addon, map_name, game, content, sun, log,
-                  lambda text, f: progress(text, 0.4 * f))
     models = []
+    contexts = []
     scripts = r.get("prerun", []) if r.get("prerun_enabled", True) else []
     for i, spec in enumerate(scripts):
         stem, mod = prerun_module(spec)
@@ -577,6 +650,51 @@ def prepare(tools, addon, map_name, frames_dir, rect=None, log=print, progress=n
         ctx = Context(tools, addon, map_name, name, r.get(stem, {}), log)
         mod.run(ctx)
         models += ctx.models
+        contexts.append(ctx)
+    # The map rebuilt from its source, once, with the sun and every script's
+    # source edits; the resource edits below apply to that copy.
+    source_edits = ([(f"sun {sun[0]:g} {sun[1]:g}", sun_edit(sun), [])] if sun else []) + \
+        [e for ctx in contexts for e in ctx.source_edits]
+    rebuilt = bool(source_edits) and rebuilt_map(tools, addon, map_name, game, content, source_edits, log,
+                                                 lambda text, f: progress(text, 0.4 + 0.1 * f))
+    from . import mapinfo
+    original = mapinfo.map_package(tools, addon, map_name)
+    source = game / "maps" / f"{map_name}.vpk" if rebuilt else original
+    map_edits = {}
+    for ctx in contexts:
+        for rel, replacements in ctx.map_edits.items():
+            map_edits.setdefault(rel, []).extend(replacements)
+    renames = {}
+    for ctx in contexts:
+        for rel, old, new in ctx.map_renames:
+            renames.setdefault(rel, []).append((old, new))
+    for rel, pairs in renames.items():
+        data = core.vpk_read(source, rel)
+        if data is None:
+            raise SystemExit(f"{rel}: not in {source}")
+        map_edits.setdefault(rel, []).append((data, mapinfo.resource_replace_strings(data, pairs)))
+    session_map = map_name
+    if map_edits:
+        session_map = f"{map_name}_dota2tools"
+        out = unshadow(game, f"maps/{session_map}.vpk")
+        core.vpk_patch(source, out, map_edits,
+                       {f"maps/{map_name}.vmap_c": f"maps/{session_map}.vmap_c"})
+        import re
+        info = game / "addoninfo.txt"
+        text = info.read_text(encoding="utf-8", errors="replace")
+
+        def list_alias(mt):
+            names = mt.group(2).split()
+            if session_map not in names:
+                names.append(session_map)
+            return f'{mt.group(1)}"{" ".join(names)}"'
+
+        text, n = re.subn(r'(?im)^(\s*"?maps"?\s+)"?([^"\n]*)"?', list_alias, text, count=1)
+        if not n:
+            text = text.replace("{", f'{{\n\t"maps"\t\t\t"{session_map}"', 1)
+        info.write_text(text, encoding="utf-8")
+        log(f"map: render-only resource edits in maps/{session_map}.vpk "
+            f"({sum(len(v) for v in map_edits.values())} replacements)")
     progress("the session", len(scripts) / (len(scripts) + 1))
     sessions = game / "elements" / "sessions"
     # A second pass without the sun's shadows when they are to be weaker:
@@ -586,11 +704,13 @@ def prepare(tools, addon, map_name, frames_dir, rect=None, log=print, progress=n
         passes.append(("_noshadow", noshadow_dir(frames_dir), False))
     elif noshadow_dir(frames_dir).exists():
         shutil.rmtree(noshadow_dir(frames_dir))
+    k = render_scale(tools)
+    export_size = (max(1, round(FRAME_W * k)), max(1, round(FRAME_H * k)))
     first = None
     for suffix, frames, shadows in passes:
         frames.mkdir(parents=True, exist_ok=True)
-        text, nx, ny = session_text(map_name, frames, rect, r.get("overlap", 0.15), models, shadows,
-                                    int(r.get("repeat", 2)))
+        text, nx, ny = session_text(session_map, frames, rect, r.get("overlap", 0.15), models, shadows,
+                                    int(r.get("repeat", 2)), size=export_size)
         base = f"topdown_{map_name}{suffix}"
         tpath = sessions / f"{base}_text.dmx"
         tpath.write_text(text, encoding="utf-8")
@@ -603,6 +723,7 @@ def prepare(tools, addon, map_name, frames_dir, rect=None, log=print, progress=n
             log(f"dmxconvert failed (rc {rc}); the text session works in SFM too: {tpath.name}")
             bpath = tpath
         log(f"session {bpath.name}: {nx} x {ny} positions, {len(camera_path(text)[0])} frames, "
+            f"export {export_size[0]}x{export_size[1]}, "
             f"rect x {rect[0]:.0f}..{rect[1]:.0f}, y {rect[2]:.0f}..{rect[3]:.0f}; frames go to {frames}")
         first = first or bpath
     return first
@@ -1086,11 +1207,25 @@ def stitch(tools, frames_dir, out_dir, addon="", map_name="dota", session=None, 
         gains = frame_gains(files, prints, log, trend=float(tools.settings["render"]["match"].get("trend", 0.5)))
     made = []
     prods = prods if prods is not None else products(tools, addon, map_name)
-    # At another scale: fixed sizes and given resolutions scaled with it
-    # (the frames' own already are).
-    if scale != 1:
+    # Output size follows the frames' own resolution (width / 3840). Do not
+    # also multiply by settings scale when frames are already at that scale
+    # (that double-counted 0.25× and put a dark lip on every tile). scale>1
+    # still grows fixed product sizes when the export really is 2×.
+    frame_scale = width / float(FRAME_W)
+    if scale > 1 and frame_scale > 1.5:
         prods = [dict(p, size=(round(p["size"][0] * scale), round(p["size"][1] * scale)) if p.get("size") else None,
                       upp=(p["upp"] / scale) if p.get("upp") else 0) for p in prods]
+    elif abs(frame_scale - 1.0) > 0.05:
+        prods = [dict(p, size=(round(p["size"][0] * frame_scale),
+                               round(p["size"][1] * frame_scale)) if p.get("size") else None,
+                      upp=(p["upp"] / frame_scale) if p.get("upp") else 0) for p in prods]
+        if abs(frame_scale - scale) > 0.1:
+            log(f"stitch: frames are {width} px wide ({frame_scale:g}×), settings scale is {scale:g}×; "
+                f"sizing the picture to the frames")
+    elif scale < 1:
+        log(f"stitch: frames came out full size ({width} px) despite scale {scale:g}× — "
+            f"export resolution did not stick; picture will be wrong-sized unless you re-export")
+
     # Each picture's share of the rest, by its pixels: stitching 85%,
     # saving the rest.
     sizes = []
@@ -1118,7 +1253,7 @@ def stitch(tools, frames_dir, out_dir, addon="", map_name="dota", session=None, 
         pngfast.save(img, path)
         log(f"{path}")
         made.append(path)
-        if scale > 1:
+        if scale > 1 and frame_scale > 1.5:
             # And at the normal scale.
             img = img.resize((round(img.size[0] / scale), round(img.size[1] / scale)), Image.LANCZOS)
             path = out_dir / f"{map_name}_{p['name']}.png"

@@ -198,18 +198,21 @@ def bake(ctx, side, tris, P, flat, steep):
                                                    cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
         return out
     out = layer(*flat)
+    rock = layer(*steep) if tuple(steep) != tuple(flat) else out
     if tuple(steep) != tuple(flat):
-        out += (layer(*steep) - out) * r
+        out += (rock - out) * r
     rel = f"materials/dota2tools/corner_{side}_ground.png"
     p = ctx.content / rel
     p.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray((np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8)).save(p)
+    Image.fromarray((np.clip(rock, 0, 1) * 255 + 0.5).astype(np.uint8)).save(
+        p.with_name(f"corner_{side}_rock.png"))
     return rel, (x0, x1, y0, y1)
 
 
-def dmx_text(tris, P, N, lift, uv_units=256.0, uv=None):
+def dmx_text(tris, P, N, lift, uv_units=256.0, uv=None, uv_values=None):
     """The triangles as a model DMX (KeyValues2; Source's axes, z up); UVs
-    world x, y over uv_units, or uv(x, y) -> (u, v)."""
+    world x, y over uv_units, uv(x, y), or explicit per-corner uv_values."""
     import uuid
     used = sorted({i for t in tris for i in t})
     index = {i: k for k, i in enumerate(used)}
@@ -219,7 +222,8 @@ def dmx_text(tris, P, N, lift, uv_units=256.0, uv=None):
     pos = arr("vector3_array", [f'"{P[i][0]:.3f} {P[i][1]:.3f} {P[i][2] + lift:.3f}"' for i in used])
     nrm = arr("vector3_array", ['"{:.5f} {:.5f} {:.5f}"'.format(*N[i]) for i in used])
     uvf = uv or (lambda x, y: (x / uv_units, y / uv_units))
-    uv = arr("vector2_array", ['"{:.6f} {:.6f}"'.format(*uvf(P[i][0], P[i][1])) for i in used])
+    values = uv_values if uv_values is not None else [uvf(p[0], p[1]) for p in P]
+    uv = arr("vector2_array", ['"{:.6f} {:.6f}"'.format(*values[i]) for i in used])
     idx = arr("int_array", [f'"{k}"' for k in range(len(used))])
     faces = arr("int_array", [f'"{index[i] if i >= 0 else -1}"' for t in tris for i in (*t, -1)])
     ids = {k: uuid.uuid4() for k in ("root", "model", "mt", "dag", "dt", "mesh", "vd", "fs", "mat", "axis")}

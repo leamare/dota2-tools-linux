@@ -18,7 +18,11 @@ from pathlib import Path
 
 from . import core
 
-S2V = "source2viewer-cli"
+# The tools' own build first (the system's may be older than the game's
+# resources: a new KV3 node type makes an old build throw the whole resource
+# away, which reads back as empty shaders and missing blocks).
+S2V_LOCAL = Path.home() / ".local" / "share" / "dota2tools" / "bin" / "source2viewer-cli"
+S2V = str(S2V_LOCAL) if S2V_LOCAL.exists() else "source2viewer-cli"
 
 
 def map_package(tools, addon, map_name):
@@ -56,6 +60,234 @@ def s2v_text(data, suffix, block="DATA"):
     return out[i:] if i >= 0 else ""
 
 
+@lru_cache(maxsize=1)
+def _zstd_library():
+    import ctypes
+    import ctypes.util
+    name = ctypes.util.find_library("zstd") or "libzstd.so.1"
+    lib = ctypes.CDLL(name)
+    lib.ZSTD_decompress.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
+    lib.ZSTD_decompress.restype = ctypes.c_size_t
+    lib.ZSTD_compress.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    lib.ZSTD_compress.restype = ctypes.c_size_t
+    lib.ZSTD_compressBound.argtypes = [ctypes.c_size_t]
+    lib.ZSTD_compressBound.restype = ctypes.c_size_t
+    lib.ZSTD_isError.argtypes = [ctypes.c_size_t]
+    lib.ZSTD_isError.restype = ctypes.c_uint
+    lib.ZSTD_getErrorName.argtypes = [ctypes.c_size_t]
+    lib.ZSTD_getErrorName.restype = ctypes.c_char_p
+    return lib
+
+
+def kv3_replace_strings(data, replacements):
+    """Same-length strings replaced in a final, zstd-compressed KV3 v5 DATA
+    block. Its two buffers and the resource envelope are rebuilt; RED2 stays
+    unchanged. Returns the complete compiled resource."""
+    import ctypes
+    if not data or len(data) < 16:
+        raise ValueError("not a Source 2 resource")
+    count = struct.unpack_from("<I", data, 12)[0]
+    table = 8 + struct.unpack_from("<I", data, 8)[0]
+    found = None
+    for k in range(count):
+        p = table + k * 12
+        kind, rel, size = struct.unpack_from("<4sII", data, p)
+        start = p + 4 + rel
+        if kind == b"DATA":
+            found = p, start, size
+    if found is None:
+        raise ValueError("resource has no DATA block")
+    meta, start, size = found
+    if start + size != len(data):
+        raise ValueError("KV3 DATA must be the resource's last block")
+    d = data[start:start + size]
+    if len(d) < 124 or struct.unpack_from("<I", d, 0)[0] != 0x4B563305 \
+            or struct.unpack_from("<I", d, 20)[0] != 2:
+        raise ValueError("expected zstd-compressed binary KV3 v5")
+    raw_sizes = [struct.unpack_from("<I", d, 72)[0], struct.unpack_from("<I", d, 80)[0]]
+    compressed_sizes = [struct.unpack_from("<I", d, 76)[0], struct.unpack_from("<I", d, 84)[0]]
+    pos = 120
+    compressed = []
+    for size in compressed_sizes:
+        compressed.append(d[pos:pos + size])
+        if len(compressed[-1]) != size:
+            raise ValueError("truncated KV3 zstd buffer")
+        pos += size
+    tail = d[pos:]
+    if len(tail) < 4:
+        raise ValueError("truncated KV3 block trailer")
+    lib = _zstd_library()
+
+    def check(ret):
+        if lib.ZSTD_isError(ret):
+            raise ValueError(lib.ZSTD_getErrorName(ret).decode("utf-8", "replace"))
+        return ret
+
+    left = set(replacements)
+    encoded = []
+    for expected, source in zip(raw_sizes, compressed):
+        buf = ctypes.create_string_buffer(max(1, expected))
+        got = check(lib.ZSTD_decompress(buf, expected, ctypes.c_char_p(source), len(source)))
+        if got != expected:
+            raise ValueError(f"KV3 zstd size mismatch: {got} != {expected}")
+        raw = buf.raw[:got]
+        for old, new in replacements:
+            if len(old) != len(new):
+                raise ValueError("compiled KV3 string replacements must preserve length")
+            if old in raw:
+                raw = raw.replace(old, new)
+                left.discard((old, new))
+        if len(raw) != expected:
+            raise ValueError("KV3 replacement changed a buffer's length")
+        bound = lib.ZSTD_compressBound(len(raw))
+        buf = ctypes.create_string_buffer(bound)
+        got = check(lib.ZSTD_compress(buf, bound, ctypes.c_char_p(raw), len(raw), 3))
+        encoded.append(buf.raw[:got])
+    if left:
+        raise ValueError(f"strings not found in KV3 DATA: {left!r}")
+    header = bytearray(d[:120])
+    struct.pack_into("<I", header, 76, len(encoded[0]))
+    struct.pack_into("<I", header, 84, len(encoded[1]))
+    struct.pack_into("<I", header, 52, sum(map(len, encoded)) + len(tail) - 4)
+    out = bytearray(data[:start] + header + encoded[0] + encoded[1] + tail)
+    struct.pack_into("<I", out, meta + 8, len(out) - start)
+    struct.pack_into("<I", out, 0, len(out))
+    return bytes(out)
+
+
+def _lz4_block(src, size):
+    """An LZ4 block (no frame) decoded to `size` bytes."""
+    out = bytearray()
+    i = 0
+    while i < len(src):
+        token = src[i]
+        i += 1
+        n = token >> 4
+        if n == 15:
+            while True:
+                b = src[i]
+                i += 1
+                n += b
+                if b != 255:
+                    break
+        out += src[i:i + n]
+        i += n
+        if i >= len(src):
+            break
+        off = src[i] | (src[i + 1] << 8)
+        i += 2
+        n = token & 15
+        if n == 15:
+            while True:
+                b = src[i]
+                i += 1
+                n += b
+                if b != 255:
+                    break
+        for _ in range(n + 4):
+            out.append(out[-off])
+    if len(out) != size:
+        raise ValueError(f"LZ4 size mismatch: {len(out)} != {size}")
+    return bytes(out)
+
+
+def _lz4_literal(raw):
+    """A valid LZ4 block holding `raw` as one run of literals."""
+    out = bytearray()
+    n = len(raw)
+    if n >= 15:
+        out.append(0xF0)
+        n -= 15
+        while n >= 255:
+            out.append(255)
+            n -= 255
+        out.append(n)
+    else:
+        out.append(n << 4)
+    return bytes(out) + raw
+
+
+def resource_replace_strings(data, replacements):
+    """Same-length strings replaced everywhere in a compiled resource: its
+    plain blocks as bytes, and inside its binary KV3 v5 blocks (zstd- or
+    LZ4-compressed buffers, rewritten). Material names, for instance, sit
+    both in RERL (plain) and in a model's MDAT (compressed KV3)."""
+    import ctypes
+    table = 8 + struct.unpack_from("<I", data, 8)[0]
+    count = struct.unpack_from("<I", data, 12)[0]
+    blocks = []
+    for k in range(count):
+        p = table + k * 12
+        kind, rel, size = struct.unpack_from("<4sII", data, p)
+        blocks.append((p, p + 4 + rel, size))
+    for old, new in replacements:
+        if len(old) != len(new):
+            raise ValueError("resource string replacements must preserve length")
+    lib = None
+    new_blocks = {}
+    for p, start, size in blocks:
+        d = data[start:start + size]
+        if len(d) >= 120 and struct.unpack_from("<I", d, 0)[0] == 0x4B563305 \
+                and struct.unpack_from("<I", d, 20)[0] in (1, 2):
+            method = struct.unpack_from("<I", d, 20)[0]
+            raw_sizes = [struct.unpack_from("<I", d, 72)[0], struct.unpack_from("<I", d, 80)[0]]
+            sizes = [struct.unpack_from("<I", d, 76)[0], struct.unpack_from("<I", d, 84)[0]]
+            pos, raws = 120, []
+            for rs, cs in zip(raw_sizes, sizes):
+                src = d[pos:pos + cs]
+                pos += cs
+                if method == 1:
+                    raws.append(_lz4_block(src, rs))
+                else:
+                    lib = lib or _zstd_library()
+                    buf = ctypes.create_string_buffer(max(1, rs))
+                    got = lib.ZSTD_decompress(buf, rs, ctypes.c_char_p(src), len(src))
+                    if lib.ZSTD_isError(got) or got != rs:
+                        raise ValueError("KV3 zstd buffer could not be read")
+                    raws.append(buf.raw[:got])
+            if not any(old in r for r in raws for old, _ in replacements):
+                continue
+            for old, new in replacements:
+                raws = [r.replace(old, new) for r in raws]
+            if method == 1:
+                enc = [_lz4_literal(r) for r in raws]
+            else:
+                enc = []
+                for r in raws:
+                    bound = lib.ZSTD_compressBound(len(r))
+                    buf = ctypes.create_string_buffer(bound)
+                    got = lib.ZSTD_compress(buf, bound, ctypes.c_char_p(r), len(r), 3)
+                    enc.append(buf.raw[:got])
+            header = bytearray(d[:120])
+            struct.pack_into("<I", header, 76, len(enc[0]))
+            struct.pack_into("<I", header, 84, len(enc[1]))
+            tail = d[pos:]
+            struct.pack_into("<I", header, 52, sum(map(len, enc)) + max(len(tail) - 4, 0))
+            new_blocks[start] = bytes(header + enc[0] + enc[1] + tail)
+        else:
+            e = d
+            for old, new in replacements:
+                e = e.replace(old, new)
+            if e != d:
+                new_blocks[start] = e
+    if not new_blocks:
+        return data
+    # Rebuilt in their order, each at its original alignment.
+    order = sorted(blocks, key=lambda b: b[1])
+    out = bytearray(data[:order[0][1]])
+    placed = {}
+    for p, start, size in order:
+        while len(out) % 16 != start % 16:
+            out.append(0)
+        placed[p] = len(out)
+        out += new_blocks.get(start, data[start:start + size])
+    for p, start, size in order:
+        body = new_blocks.get(start)
+        struct.pack_into("<II", out, p + 4, placed[p] - (p + 4), len(body) if body is not None else size)
+    struct.pack_into("<I", out, 0, len(out))
+    return bytes(out)
+
+
 def decompile_model(data):
     """A compiled model's meshes (source2viewer-cli -d): [(positions, normals,
     [triangles per face set])], world space for map aggregates."""
@@ -65,7 +297,10 @@ def decompile_model(data):
         f.write_bytes(data)
         subprocess.run([S2V, "-i", str(f), "-o", str(Path(d) / "out"), "-d"], capture_output=True, cwd=d)
         meshes = []
-        for dmx in sorted(Path(d).glob("*meshset*.dmx")) + sorted(Path(d).glob("out/**/*meshset*.dmx")):
+        # Newer source2viewer names a model's mesh DMX after the model, not
+        # *meshset*; take every DMX the decompile wrote.
+        found = sorted(Path(d).glob("**/*.dmx"))
+        for dmx in found:
             x = dmxbin.Dmx(dmx.read_bytes())
             vd = [e for e in x.elements if e.type == "DmeVertexData"][0]
             pos = vd.attrs["position$0"]
@@ -91,6 +326,52 @@ def decompile_model(data):
     return meshes
 
 
+def decompile_textured(data):
+    """Compiled model meshes with per-face-corner positions, normals and UVs:
+    [(P, N, UV, [(material path, triangles), ...])]. Used when selected cards
+    need copying without losing their original texture coordinates."""
+    import numpy as np
+    from . import dmxbin
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "m.vmdl_c"
+        f.write_bytes(data)
+        subprocess.run([S2V, "-i", str(f), "-o", str(Path(d) / "out"), "-d"], capture_output=True, cwd=d)
+        meshes = []
+        for dmx in sorted(Path(d).glob("**/*.dmx")):
+            x = dmxbin.Dmx(dmx.read_bytes())
+            vd = [e for e in x.elements if e.type == "DmeVertexData"][0]
+
+            def stream(name, width, default):
+                if name not in vd.attrs or name + "Indices" not in vd.attrs:
+                    return []
+                vals = np.asarray(vd.attrs[name], np.float32).reshape(-1, width)
+                return vals[np.asarray(vd.attrs[name + "Indices"], np.int64)]
+
+            P = stream("position$0", 3, (0, 0, 0))
+            N = stream("normal$0", 3, (0, 0, 1))
+            UV = stream("texcoord$0", 2, (0, 0))
+            if not len(N):
+                N = np.tile(np.asarray((0, 0, 1), np.float32), (len(P), 1))
+            if not len(UV):
+                UV = np.zeros((len(P), 2), np.float32)
+            sets = []
+            for e in x.elements:
+                if e.type != "DmeFaceSet":
+                    continue
+                tris, poly = [], []
+                for k in e.attrs["faces"]:
+                    if k < 0:
+                        tris += [(poly[0], poly[j], poly[j + 1]) for j in range(1, len(poly) - 1)]
+                        poly = []
+                    else:
+                        poly.append(k)
+                mi = e.attrs.get("material", -1)
+                mat = x.elements[mi].attrs.get("mtlName", "") if 0 <= mi < len(x.elements) else ""
+                sets.append((mat, tris))
+            meshes.append((P, N, UV, sets))
+    return meshes
+
+
 def decompile_streams(data):
     """A compiled model's first mesh with every vertex stream, per face
     corner: ({stream name: array (n, k)}, triangles (m, 3)) -- texcoord$1..3
@@ -102,7 +383,7 @@ def decompile_streams(data):
         f = Path(d) / "m.vmdl_c"
         f.write_bytes(data)
         subprocess.run([S2V, "-i", str(f), "-o", str(Path(d) / "out"), "-d"], capture_output=True, cwd=d)
-        found = sorted(Path(d).glob("*meshset*.dmx")) + sorted(Path(d).glob("out/**/*meshset*.dmx"))
+        found = sorted(Path(d).glob("**/*.dmx"))
         if not found:
             return {}, np.zeros((0, 3), np.int64)
         x = dmxbin.Dmx(found[0].read_bytes())
@@ -263,12 +544,15 @@ def source_vmat(m, textures, changes=None, comment=""):
     lines = [f'shader "{m["shader"]}"']
     for k, v in {**m["ints"], **{k: v for k, v in changes.items() if k.startswith("F_")}}.items():
         lines.append(f"{k} {int(v)}")
-    for k, v in m["floats"].items():
-        lines.append(f'{k} "{float(changes.get(k, v)):.6f}"')
-    for k, v in m["vectors"].items():
+    float_changes = {k: v for k, v in changes.items()
+                     if not k.startswith("F_") and isinstance(v, (int, float))}
+    for k in dict.fromkeys([*m["floats"], *float_changes]):
+        lines.append(f'{k} "{float(changes.get(k, m["floats"].get(k, 0.0))):.6f}"')
+    vector_changes = {k: v for k, v in changes.items() if isinstance(v, (list, tuple))}
+    for k in dict.fromkeys([*m["vectors"], *vector_changes]):
         if k.startswith("Texture"):
             continue
-        v = changes.get(k, v)
+        v = changes[k] if k in changes else m["vectors"][k]
         lines.append(f'{k} "[' + " ".join(f"{x:.6f}" for x in v) + ']"')
     for k, path in textures.items():
         lines.append(f'{k} "{path}"')

@@ -120,11 +120,12 @@ class RenderTab(QtWidgets.QWidget):
         self.trend.setEnabled(self.match_mode.currentData() == "auto")
         f.addRow("Colour across the map", self.trend)
         self.scale = QtWidgets.QComboBox()
-        for k, label in ((0.5, "0.5× (half size)"), (1.0, "1×"), (2.0, "2× (and 1× copies)")):
+        for k, label in ((0.25, "0.25× (quick test)"), (0.5, "0.5× (half size)"),
+                         (1.0, "1×"), (2.0, "2× (and 1× copies)")):
             self.scale.addItem(label, k)
         self.scale.setCurrentIndex(max(0, self.scale.findData(float(r.get("scale", 1.0)))))
-        self.scale.setToolTip("frames at this many times the resolution; 2× saves every picture at 2× and 1×, "
-                              "0.5× everything at half size")
+        self.scale.setToolTip("SFM export resolution vs 3840×2160: lower = fewer pixels per frame = faster "
+                              "export (0.25× / 0.5× for quick tests). 2× exports bigger and also saves 1×.")
         self.scale.currentIndexChanged.connect(lambda _i: self.show_grid())
         f.addRow("Scale", self.scale)
         v.addWidget(g)

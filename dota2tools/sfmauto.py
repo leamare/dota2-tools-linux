@@ -195,6 +195,8 @@ def render(tools, map_name, frames_dir, log=print, progress=lambda _t, _f: None,
                / f"topdown_{map_name}{suffix}.dmx")
     if not session.exists():
         session = session.with_name(f"topdown_{map_name}{suffix}_text.dmx")
+    if not session.exists():
+        raise SystemExit(f"prepared SFM session not found: {session} (run render prepare first)")
     from . import maprender
     addon = (tools.root / "game" / "dota_addons" / r["render_addon"] / ".dota2tools_source").read_text().strip() \
         if (tools.root / "game" / "dota_addons" / r["render_addon"] / ".dota2tools_source").exists() else ""
@@ -253,7 +255,8 @@ def render(tools, map_name, frames_dir, log=print, progress=lambda _t, _f: None,
             exp = export_dialog()
         if size != (3840, 2160):
             set_resolution(h, exp, *size)
-            log(f"export resolution {size[0]} x {size[1]}")
+            log(f"export resolution {size[0]} x {size[1]} (session movieSettings match)")
+
         if os.environ.get("DOTA2TOOLS_SHOT_EXPORT"):
             time.sleep(3)
             h.screenshot(os.environ["DOTA2TOOLS_SHOT_EXPORT"])

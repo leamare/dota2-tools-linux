@@ -96,9 +96,9 @@ DEFAULT_SETTINGS = {
                            "+r_max_texture_pool_size 6144 +r_dota_allow_parallax_mapping 0",
                # The sun for the render only (pitch, yaw in degrees; empty: the
                # map's own): a copy of the map rebuilt from its source with it.
-               # Pixels per unit against the default (frames of 3840 x 2160): 2
-               # renders frames twice the size and saves each picture at 2x and
-               # 1x; 0.5 renders and saves everything at half size.
+               # SFM export resolution vs 3840×2160. Lower = fewer pixels per
+               # frame = faster export (0.25 / 0.5 for quick tests). 2 = bigger
+               # frames, stitch also writes a 1× picture.
                "scale": 1.0,
                # Frames per camera position, the sharpest kept: the texture
                # streaming falls behind now and then in a long export.
@@ -112,14 +112,33 @@ DEFAULT_SETTINGS = {
                # them is exported and the two blended.
                "shadows": 1.0,
                "prerun_enabled": True,
-               "prerun": ["builtin:flies", "builtin:tools_materials", "builtin:edge_trees", "builtin:corners", "builtin:lava"],
+               "prerun": ["builtin:flies", "builtin:tools_materials", "builtin:edge_trees",
+                          "builtin:corners", "builtin:lava", "builtin:dire_lava_corner", "builtin:fountain",
+                          "builtin:riverbed"],
                # prerun/edge_trees.py: the edge trees' leaves an oak's (tint: recoloured)
                "edge_trees": {"tint": "", "shade": 0.7, "unlit": False},
                # prerun/corners.py: the black fields beyond the corners as models on
                # the map's ground, lift units above the black mesh.
                "corners": {"lift": 2.0},
-               # prerun/lava.py: the lava copied as unlit models, lift units up.
-               "lava": {"lift": 1.0, "brightness": 1.5}},
+               # prerun/lava.py: the lava copied as unlit models; bridge/extend
+               # fill gaps and reach stones; max_rise stops growth at stones.
+               "lava": {"lift": 4.0, "brightness": 1.5, "repeat": 384.0, "texture_res": 0.75,
+                        "max_side": 4096, "tile_overlap": 224.0, "feather": 16.0,
+                        "bridge": 512.0, "extend": 128.0, "max_rise": 128.0, "bank": 32.0,
+                        "paint_min": 0.1, "join_light": 0.35,
+                        "bank_floor": 0.35, "bank_texture": True, "mesh_res": 6.0,
+                        "edge_feather": 6.0, "shared_atlas": False, "grass_noshadow": True},
+               # prerun/dire_lava_corner.py: the Dire base's lava joined round its
+               # corner (its options are the lava's, above).
+               "dire_lava_corner": {},
+               # prerun/fountain.py: lotus-pool cyan water stuck at mid (0,0).
+               "fountain": {},
+               # prerun/riverbed.py: mid's stray Radiant riverbed tile on the Dire
+               # riverbed material (a rebuilt map copy, its tile set cloned).
+               "riverbed": {},
+               # prerun/dire_base_tiles.py: the Dire base drawn from one tile grid
+               # layer (the seam left of the fountain).
+               "dire_base_tiles": {}},
 }
 
 
@@ -311,6 +330,103 @@ def vpk_read(dir_path, rel):
     with open(archive, "rb") as f:
         f.seek(end + off if ai == 0x7FFF else off)
         return data + f.read(ln)
+
+
+def vpk_patch(dir_path, out_path, replacements, renames=None):
+    """Copy a single-file VPK with byte replacements and renamed entries.
+
+    replacements: {resource path: [(old bytes, new bytes), ...]}. Lengths may
+    change. renames maps original resource paths to their output paths. The
+    output is VPK1, with its tree, offsets and changed CRCs rebuilt; VPK2's
+    checksum/signature footer is intentionally not carried over.
+    """
+    import zlib
+    dir_path, out_path = Path(dir_path), Path(out_path)
+    renames = renames or {}
+    raw = dir_path.read_bytes()
+    sig, ver, tree_size = struct.unpack_from("<III", raw, 0)
+    if sig != 0x55AA1234 or ver not in (1, 2):
+        raise ValueError(f"not a VPK1/2 directory: {dir_path}")
+    pos = 28 if ver == 2 else 12
+    end = pos + tree_size
+    data_size = struct.unpack_from("<I", raw, 12)[0] if ver == 2 else len(raw) - end
+    source = raw[end:end + data_size]
+    tree = raw[pos:end]
+    data = bytearray()
+    entries = []
+    seen = set()
+    left, left_renames = set(replacements), set(renames)
+
+    def cstr(p):
+        e = tree.index(0, p)
+        return tree[p:e].decode("utf-8", "replace"), e + 1
+
+    p = 0
+    while p < len(tree):
+        ext, p = cstr(p)
+        if not ext:
+            break
+        while True:
+            folder, p = cstr(p)
+            if not folder:
+                break
+            while True:
+                name, p = cstr(p)
+                if not name:
+                    break
+                crc, preload, ai, off, ln, term = struct.unpack_from("<IHHIIH", tree, p)
+                p += 18
+                preload_bytes = tree[p:p + preload]
+                p += preload
+                if ai != 0x7FFF:
+                    raise ValueError(f"VPK has external archives: {dir_path}")
+                rel = (f"{folder}/" if folder.strip() else "") + f"{name}.{ext}"
+                chunk = bytes(source[off:off + ln])
+                if rel in replacements:
+                    if preload_bytes:
+                        raise ValueError(f"cannot patch preloaded VPK entry {rel}")
+                    for old, new in replacements[rel]:
+                        if old not in chunk:
+                            raise ValueError(f"{old!r} not found in {rel}")
+                        chunk = chunk.replace(old, new)
+                    crc = zlib.crc32(chunk) & 0xFFFFFFFF
+                    left.discard(rel)
+                new_rel = renames.get(rel, rel)
+                left_renames.discard(rel)
+                new_folder, _, filename = new_rel.rpartition("/")
+                new_name, dot, new_ext = filename.rpartition(".")
+                if not dot or not new_name or not new_ext or "\\" in new_rel:
+                    raise ValueError(f"invalid VPK entry name: {new_rel}")
+                if new_rel in seen:
+                    raise ValueError(f"duplicate VPK entry after renaming: {new_rel}")
+                seen.add(new_rel)
+                entries.append((new_ext, new_folder or " ", new_name, crc, preload_bytes,
+                                len(data), len(chunk), term))
+                data.extend(chunk)
+    if left or left_renames:
+        missing = sorted(left | left_renames)
+        raise ValueError(f"VPK entries not found: {', '.join(missing)}")
+
+    groups = {}
+    for entry in entries:
+        ext, folder = entry[:2]
+        groups.setdefault(ext, {}).setdefault(folder, []).append(entry)
+    tree = bytearray()
+    for ext, folders in groups.items():
+        tree.extend(ext.encode() + b"\0")
+        for folder, group in folders.items():
+            tree.extend(folder.encode() + b"\0")
+            for _ext, _folder, name, crc, preload_bytes, off, ln, term in group:
+                tree.extend(name.encode() + b"\0")
+                tree.extend(struct.pack("<IHHIIH", crc, len(preload_bytes), 0x7FFF, off, ln, term))
+                tree.extend(preload_bytes)
+            tree.append(0)
+        tree.append(0)
+    tree.append(0)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    tmp.write_bytes(struct.pack("<III", sig, 1, len(tree)) + tree + data)
+    tmp.replace(out_path)
 
 
 # --- the tools folder -------------------------------------------------------
@@ -861,7 +977,7 @@ def game_args(addon="", map_name="", vconsole=True, extra=""):
     return args + extra.split()
 
 
-def proton_run(tools, exe, args, prefix_name="cli_prefix"):
+def proton_run(tools, exe, args, prefix_name="cli_prefix", gpu=False):
     """A console tool of the tools (dmxconvert, resourcecompiler), no
     display, in a prefix of its own; returns (rc, output). Run with Proton's
     own wine rather than `proton run`, which swallows the tools' messages
@@ -872,10 +988,13 @@ def proton_run(tools, exe, args, prefix_name="cli_prefix"):
     prefix = tools.meta / prefix_name
     prefix.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, STEAM_COMPAT_DATA_PATH=str(prefix),
-               STEAM_COMPAT_CLIENT_INSTALL_PATH=str(tools.steam), PROTON_USE_XALIA="0",
-               __GLX_VENDOR_LIBRARY_NAME="mesa", LIBGL_ALWAYS_SOFTWARE="1", GALLIUM_DRIVER="llvmpipe")
-    env.pop("DISPLAY", None)
-    env.pop("WAYLAND_DISPLAY", None)
+               STEAM_COMPAT_CLIENT_INSTALL_PATH=str(tools.steam), PROTON_USE_XALIA="0")
+    if not gpu:
+        # No display and software GL: enough for every resource but a map,
+        # whose light baking stalls on it (the map's compile is gpu=True).
+        env.update(__GLX_VENDOR_LIBRARY_NAME="mesa", LIBGL_ALWAYS_SOFTWARE="1", GALLIUM_DRIVER="llvmpipe")
+        env.pop("DISPLAY", None)
+        env.pop("WAYLAND_DISPLAY", None)
     if not (prefix / "pfx" / "system.reg").exists():
         subprocess.run([script, "run", "cmd", "/c", "exit"], cwd=tools.win64, env=env, capture_output=True)
     wine = Path(script).parent / "files" / "bin" / "wine"
@@ -889,12 +1008,13 @@ def proton_run(tools, exe, args, prefix_name="cli_prefix"):
     return p.returncode, out
 
 
-def resource_compile(tools, content_file):
+def resource_compile(tools, content_file, gpu=False):
     """resourcecompiler -f on one content file; (ok, its messages). It exits
-    0 on a failed file too: the summary line tells."""
+    0 on a failed file too: the summary line tells. gpu: with the real
+    display and GPU (a map: its light baking never ends on software GL)."""
     rc, out = proton_run(tools, "resourcecompiler.exe",
                          ["-f", "-nop4", "-game", winpath(tools.root / "game" / "dota"),
-                          "-i", winpath(content_file)], prefix_name="rc_prefix")
+                          "-i", winpath(content_file)], prefix_name="rc_prefix", gpu=gpu)
     ok = rc == 0 and " 0 failed" in out and (" compiled" in out)
     return ok, out
 
