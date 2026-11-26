@@ -14,7 +14,8 @@ Steps (the launcher's Map renderer window does all but the SFM clicks):
      mirrors the chosen addon (its maps and assets, linked) or stands alone for
      the base game's maps; the pre-run scripts (render.prerun in the settings,
      default builtin:flies, builtin:tools_materials, builtin:edge_trees,
-     builtin:corners, builtin:lava, builtin:fountain, builtin:riverbed) write and compile
+     builtin:corners, builtin:lava, builtin:dire_lava_corner, builtin:fountain,
+     builtin:riverbed, builtin:dire_base_paint) write and compile
      material overrides and models into it; the session, with those models in
      its scene, goes to its elements/sessions.
   2. launch the tools on the render addon, Tools -> Source Filmmaker, File ->

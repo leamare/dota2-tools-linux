@@ -147,6 +147,7 @@ The outputs:
 - `dire_lava_corner` joins the Dire base's two lava channels round its corner (dota), with a rim of crust and dark rock fading into the ground;
 - `fountain` hides the lotus pool's ambient water, which draws as a cyan blot at mid in a top-down render;
 - `riverbed` puts mid's stray Radiant riverbed tile on the Dire riverbed material, leaving its stairs Radiant;
+- `dire_base_paint` copies the lighter ground paint across the Dire base's layer seam, feathering its outer edges without moving tiles, trees or props;
 - `dire_base_tiles` (not on by default) draws the Dire base from one tile grid layer, removing the seam left of the fountain; it also changes that area's trees and props.
 
 Some scripts change the map's source, not only its compiled resources. The map is then rebuilt from its source once, with every such change and the custom sun, and cached in `.dota2_tools/cache/rebuilt` until the source or the changes differ. Its compile uses the real display and GPU: on the software renderer its light baking never finishes.

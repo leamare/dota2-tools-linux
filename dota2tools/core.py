@@ -114,7 +114,7 @@ DEFAULT_SETTINGS = {
                "prerun_enabled": True,
                "prerun": ["builtin:flies", "builtin:tools_materials", "builtin:edge_trees",
                           "builtin:corners", "builtin:lava", "builtin:dire_lava_corner", "builtin:fountain",
-                          "builtin:riverbed"],
+                          "builtin:riverbed", "builtin:dire_base_paint"],
                # prerun/edge_trees.py: the edge trees' leaves an oak's (tint: recoloured)
                "edge_trees": {"tint": "", "shade": 0.7, "unlit": False},
                # prerun/corners.py: the black fields beyond the corners as models on
@@ -136,6 +136,9 @@ DEFAULT_SETTINGS = {
                # prerun/riverbed.py: mid's stray Radiant riverbed tile on the Dire
                # riverbed material (a rebuilt map copy, its tile set cloned).
                "riverbed": {},
+               # prerun/dire_base_paint.py: copy the lighter paint over the Dire
+               # base's layer seam, without moving its tiles, trees or props.
+               "dire_base_paint": {},
                # prerun/dire_base_tiles.py: the Dire base drawn from one tile grid
                # layer (the seam left of the fountain).
                "dire_base_tiles": {}},
