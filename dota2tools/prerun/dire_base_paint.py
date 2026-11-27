@@ -3,21 +3,21 @@
 West of x 5888 dota draws the base from dire_base; east of it defaultLayer
 uses the same tiles but darker paint. In the render-only map rebuilt from its
 source, copy dire_base's blendColor and blendOpacity to defaultLayer at the
-same sample positions in the two-cell rectangle north of the stairs. The west
+same sample positions in the rectangle around and north of the stairs. The west
 edge already borders dire_base and receives the donor values in full; the
 other three edges feather into defaultLayer's original paint. Tiles, props,
 orientations, material sets, paths, transitions and heights stay unchanged.
 
 Options (settings.json, render.dire_base_paint): "from" (donor layer, default
 "dire_base"), "to" (default "defaultLayer"), "rect" ([x0, x1, y0, y1],
-default [5888, 6400, 5888, 6528] on dota, none elsewhere) and "feather"
+default [5888, 6400, 5376, 6528] on dota, none elsewhere) and "feather"
 (world units at the north, east and south edges, default 96).
 """
 import re
 
 from dota2tools import maprender
 
-RECT = (5888, 6400, 5888, 6528)
+RECT = (5888, 6400, 5376, 6528)
 PAINT = ("blendColor", "blendOpacity")
 
 

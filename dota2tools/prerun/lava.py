@@ -4,20 +4,22 @@ The map's lava (on dota: the channels along the Dire base's border) is
 terrain on a blend material whose lava layers glow through a self-illum
 mask. The map's world meshes carry an emissive factor of 0 (in the map
 itself, which a render addon can't change), so in the tools the lava draws
-as dark, unlit rock. Here each spatial group on such a material is copied
-into a model of the render addon on an unlit material of the lava layer's
-own texture, and put into the SFM session just above the map's. Distant
-patches get separate atlases. Large channels are tiled too, but every tile
-samples one light field and one coarse coverage field for the whole spatial
-group, avoiding brightness and false-border seams. Tile meshes clip to
-non-overlapping ownership rectangles inside their gutters.
+as dark, unlit rock. Here the lava is copied into render-addon models on an
+unlit material of the lava layer's own texture, and put into the SFM session
+just above the map's. Roshan's pit and the small pools keep their original
+meshes and get a plain light bake, without growth or grass removal. On dota,
+builtin:dire_lava_corner (with this script in the pre-run list too) joins the
+Dire base's three connected channels round its corner. Large joined channels
+are tiled, but every tile samples one light field and one coarse coverage
+field for the whole spatial group, avoiding brightness and false-border
+seams. Tile meshes clip to non-overlapping ownership rectangles inside their
+gutters.
 
-Lava grown up to stones and raised ground stays at the lava's own height
-and reaches a little under them, so its edge is hidden beneath them. Grass
-and identified tree-leaf cards rooted in the final lava coverage (not on a
-bank above it) are removed; all survivors keep their original UVs and cast
-no sun shadows. On dota, builtin:dire_lava_corner (with this script in the
-pre-run list too) joins the Dire base's two channels round its corner.
+In the joined corner, lava grown up to stones and raised ground stays at the
+lava's own height and reaches a little under them, so its edge is hidden
+beneath them. Grass and identified tree-leaf cards rooted in the final lava
+coverage (not on a bank above it) are removed; all survivors keep their
+original UVs and cast no sun shadows.
 
 Options (settings.json, render.lava): "lift" (units above the map and corner
 ground, default 4), "brightness" (default 1.5), "repeat" (world units per lava
@@ -38,10 +40,14 @@ the north/north-east outer edge darkens over, default 32), "bank_floor" (darkest
 bank multiplier, default 0.35), "bank_texture" (blend highground rock into outer
 banks, default true), "mesh_res" (overlay grid step, default 6), "edge_feather"
 (local silhouette antialiasing, default 6), "shared_atlas"
-(default false), "grass_noshadow" (default true). Growth happens at mesh_res and
-cannot jump across stone banks. The manual join clears the terrain/corner base
-but stays below stone props. Huge channels are split into balanced overlapping
-tiles so each atlas stays within max_side at texture_res.
+(default false), "grass_noshadow" (default true), "roshan_brightness"
+(Roshan-only plain-bake gain, default 1.8), "roshan_edge" (Roshan's
+right/bottom fade to black, default 96), "corner_min_y" and
+"corner_south_fade" (the joined overlay's crossfade into the plain southern
+channel, 4096 and 512). Growth happens at mesh_res and cannot jump across stone
+banks. The manual join clears the terrain/corner base but stays below stone
+props. Huge channels are split into balanced overlapping tiles so each atlas
+stays within max_side at texture_res.
 """
 import math
 import re
@@ -795,6 +801,10 @@ def bake(ctx, stem, m, layer, tint, P, tris, repeat, data=None, extent=None,
         # The lava under the rim's edge: no feather of its own.
         near = zone & (lava_cov > 0)
         alpha = np.where(near, np.maximum(alpha, (cov > 0).astype(np.float32)), alpha)
+    south = south_blend(ctx)
+    if south is not None:
+        a = np.clip((ys - south[0]) / (south[1] - south[0]), 0, 1)
+        alpha *= (a * a * (3 - 2 * a))[:, None]
     rgba = np.concatenate([np.clip(out + 0.5, 0, 255), (alpha * 255)[:, :, None]], axis=2)
     rel = f"materials/dota2tools/textures/{stem}_baked.png"
     p = ctx.content / rel
@@ -1029,6 +1039,202 @@ def spatial_groups(P, sets, gap):
     return [[t for i in sorted(g) for t in sets[i]] for g in groups]
 
 
+def bake_plain(ctx, stem, m, layer, tint, P, tris, repeat, data=None, roshan=False):
+    """The lava over the mesh's extent: the lava layer's texture where the
+    mesh's vertex paint (its VertexPaintTintColor: bright along the flow,
+    dark at the banks and the rocks -- the map's own shading, which the
+    current shader leaves unused) is bright, the blend's crust where it is
+    dark, glowing where the self-illum mask says, shaded by the world around
+    (lightbake). Returns (extent, the texture's path). The bake every lava
+    patch but the Dire corner's gets: over its own mesh, nothing grown."""
+    import cv2
+    import numpy as np
+    from PIL import Image
+    from dota2tools import lightbake
+    o = ctx.options
+    res, tex_res, margin = float(o.get("bake_res", 8.0)), float(o.get("plain_texture_res", 3.0)), 600.0
+    V = np.asarray(P, np.float32)[np.asarray(tris, np.int64)]
+    x0, y0 = V[..., 0].min(), V[..., 1].min()
+    x1, y1 = V[..., 0].max(), V[..., 1].max()
+    region = (x0 - margin, x1 + margin, y0 - margin, y1 + margin)
+    ctx.log(f"lava: reading the world's geometry around {stem}")
+    world = solid_meshes(ctx)
+    H, _ = lightbake.height_field(world, region, res)
+    H = lightbake._fill(H)
+    # Thin things (chains hung over the lava, poles) shade almost nothing: an
+    # opening takes away what is narrower than ~9 cells.
+    k = np.ones((9, 9), np.uint8)
+    H = cv2.dilate(cv2.erode(H, k), k)
+    Z, _ = lightbake.height_field([(stem, np.asarray(P, np.float32), np.asarray(tris, np.int64))], region, res)
+    Z0 = Z
+    Z = np.where(Z < -1e8, H, Z)
+    pitch, yaw = light_direction(ctx)
+    vis, ao = lightbake.shading(H, Z, res, pitch, yaw, ao_radius=float(o.get("ao_radius", 900.0)))
+    # Lava lit itself: mostly how open each point is (the rocks and banks
+    # around shut its light in), the sun's shadows only a little.
+    sun = float(o.get("sun", 0.5))
+    # The lava's openest stays at full brightness: occlusion relative to it
+    # (the whole channel lies in a trench).
+    lava_cells = Z0 > -1e8
+    top = np.percentile(ao[lava_cells], 90) if lava_cells.any() else 1.0
+    ao = np.clip(ao / max(top, 1e-3), 0, 1)
+    S = ao ** float(o.get("occlusion", 2.5)) * ((1 - sun) + sun * vis)
+    # Where the lava meets rock (a bank, a boulder standing in it) it goes
+    # dark over the last few hundred units: the distance to anything standing
+    # above it.
+    edge_units = float(o.get("edge", 160.0))
+    if edge_units > 0:
+        above = ((H - Z) > 24.0).astype(np.uint8)
+        dist = cv2.distanceTransform(1 - above, cv2.DIST_L2, 5) * res
+        e = np.clip(dist / edge_units, 0, 1)
+        e = e * e * (3 - 2 * e)
+        lo = float(o.get("edge_floor", 0.08))
+        S = S * (lo + (1 - lo) * e)
+    # Light bounced and glowing around: the shade spreads softly.
+    soft = float(o.get("soften", 40.0)) / res
+    if soft > 0:
+        S = cv2.GaussianBlur(S.astype(np.float32), (0, 0), soft)
+    # The mesh's extent, at the texture's resolution.
+    m0, m1 = int(margin / res), int(margin / res)
+    S = S[m1:S.shape[0] - m1, m0:S.shape[1] - m0]
+    # Power-of-two sides (the tools want them), at least tex_res's detail.
+    def side(span):
+        return min(8192, 2 ** max(4, math.ceil(math.log2(max(span / tex_res, 1)))))
+    W, Hh = side(x1 - x0), side(y1 - y0)
+    S = cv2.resize(S, (W, Hh), interpolation=cv2.INTER_LINEAR)
+    texa = np.asarray(mapinfo.texture_image(ctx.tools, ctx.addon, ctx.map, m["textures"][f"g_tColor{layer}"])
+                      .convert("RGBA"), np.float32)
+    tex, height = texa[..., :3], texa[..., 3] / 255
+    spec = mapinfo.texture_image(ctx.tools, ctx.addon, ctx.map, m["textures"][f"g_tSpecular{layer}"])
+    mask = np.asarray(spec.convert("RGBA").split()[1].resize((tex.shape[1], tex.shape[0])), np.float32) / 255
+    th, tw = tex.shape[:2]
+    xs = x0 + (np.arange(W) + 0.5) * (x1 - x0) / W
+    ys = y1 - (np.arange(Hh) + 0.5) * (y1 - y0) / Hh
+    ui = (np.mod(xs / repeat, 1.0) * tw).astype(np.int64) % tw
+    vi = ((1 - np.mod(ys / repeat, 1.0)) * th).astype(np.int64) % th
+    col = tex[vi][:, ui]
+    glow = mask[vi][:, ui]
+    g = float(o.get("glow", 0.6))
+    lava = col * np.asarray(tint, np.float32) * (1 + g * glow[:, :, None])
+    paint = None
+    if data is not None and o.get("paint", True):
+        streams, ptris = mapinfo.decompile_streams(data)
+        if "texcoord$3" in streams and "position$0" in streams:
+            grid, covered = lightbake.rasterize(streams["position$0"], ptris, streams["texcoord$3"][:, :3],
+                                                (x0, x1, y0, y1), 6.0)
+            k = grid.mean(2)
+            # Uncovered cells (gaps): their neighbours'.
+            k = np.where(covered, k, cv2.dilate(k, np.ones((5, 5), np.uint8)))
+            paint = cv2.resize(k, (W, Hh), interpolation=cv2.INTER_LINEAR)[:, :, None]
+    if paint is not None:
+        # The blend's own way: the crust comes up through the lava where the
+        # lava texture's height (its alpha: a network of cracks) stands above
+        # a threshold the paint sets -- thin veins where the paint is full,
+        # wide crust where it fades. The crust: the lava, darkened.
+        a = height[vi][:, ui]
+        thr = float(o.get("crust_base", 0.3)) + float(o.get("crust_span", 0.6)) * paint[:, :, 0]
+        c = np.clip((thr - a) / float(o.get("crust_soft", 0.18)) + 0.5, 0, 1)
+        c = (c * c * (3 - 2 * c))[:, :, None]
+        dim = float(o.get("paint_dim", 0.65))
+        out = (lava * c * ((1 - dim) + dim * paint) + lava * float(o.get("crust", 0.18)) * (1 - c)) * S[:, :, None]
+    else:
+        out = lava * S[:, :, None]
+    if roshan:
+        # Level ground does not trigger the occlusion edge above. Follow the
+        # actual mesh's right and bottom borders into black instead.
+        Pa = np.asarray(P, np.float32)
+        Ta = np.asarray(tris, np.int64)
+        cell = max((x1 - x0) / W, (y1 - y0) / Hh)
+        _values, edge_cover = lightbake.rasterize(
+            Pa, Ta, np.ones((len(Pa), 1), np.float32), (x0, x1, y0, y1), cell)
+        if edge_cover.shape != (Hh, W):
+            edge_cover = cv2.resize(edge_cover.astype(np.uint8), (W, Hh),
+                                    interpolation=cv2.INTER_NEAREST) > 0
+        rows, cols = np.arange(Hh)[:, None], np.arange(W)[None, :]
+        right = np.where(edge_cover, cols, -1).max(axis=1)
+        bottom = np.where(edge_cover, rows, -1).max(axis=0)
+        distance = np.minimum(np.maximum(right[:, None] - cols, 0),
+                              np.maximum(bottom[None, :] - rows, 0))
+        width = float(o.get("roshan_edge", 96.0)) / cell
+        fade = np.clip(distance / max(width, 1.0), 0, 1)
+        fade = fade * fade * (3 - 2 * fade)
+        out *= fade[:, :, None]
+        ctx.log(f"lava: Roshan right/bottom edge fade {width * cell:g} units")
+    rel = f"materials/dota2tools/textures/{stem}_baked.png"
+    p = ctx.content / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(np.clip(out + 0.5, 0, 255).astype(np.uint8)).save(p)
+    ctx.log(f"lava: {stem}'s light baked, {W} x {Hh} px, light at {pitch:.0f} deg down, yaw {yaw:.0f}")
+    return (float(x0), float(x1), float(y0), float(y1)), rel
+
+
+def corner_sets(ctx, P, sets):
+    """Indices of the face sets the Dire corner's bake takes: those reaching
+    into its area and every set touching them (the channels it joins), on
+    dota with builtin:dire_lava_corner on; none otherwise."""
+    import numpy as np
+    if not dlc.enabled(ctx):
+        return set()
+    boxes = {}
+    for i, tris in enumerate(sets):
+        if tris:
+            V = np.asarray(P, np.float32)[np.asarray(tris, np.int64)]
+            boxes[i] = (float(V[..., 0].min()), float(V[..., 0].max()),
+                        float(V[..., 1].min()), float(V[..., 1].max()))
+
+    def meet(a, b):
+        return not (a[1] < b[0] or b[1] < a[0] or a[3] < b[2] or b[3] < a[2])
+
+    picked = {i for i, b in boxes.items() if meet(b, dlc.CORNER_BOX)}
+    grew = True
+    while grew:
+        grew = False
+        for i, b in boxes.items():
+            if i not in picked and any(meet(b, boxes[j]) for j in picked):
+                picked.add(i)
+                grew = True
+    return picked
+
+
+def south_blend(ctx):
+    """The joined overlay's fade into the original-mesh southern channel."""
+    if not dlc.enabled(ctx):
+        return None
+    low = float(ctx.options.get("corner_min_y", 4096.0))
+    width = max(1.0, float(ctx.options.get("corner_south_fade", 512.0)))
+    return low, low + width
+
+
+def roshan_set(ctx, P, tris):
+    """The base Dota map's Roshan-pit face set, by its world bounds."""
+    if ctx.map != "dota" or ctx.addon or not tris:
+        return False
+    import numpy as np
+    V = np.asarray(P, np.float32)[np.asarray(tris, np.int64)]
+    x = (float(V[..., 0].min()) + float(V[..., 0].max())) / 2
+    y = (float(V[..., 1].min()) + float(V[..., 1].max())) / 2
+    return -3900 <= x <= -2700 and 2100 <= y <= 3300
+
+
+def plain_piece(ctx, stem, mat, m, layer, tint, P, N, tris, data, repeat, roshan=False):
+    """A lava patch as the map has it: its own mesh, its light baked, drawn
+    unlit just above the map's."""
+    box, png = bake_plain(ctx, stem, m, layer, tint, P, tris, repeat, data, roshan=roshan)
+    bx0, bx1, by0, by1 = box
+    vmat = f"materials/dota2tools/{stem}.vmat"
+    ctx.write(f"{FOLDER}/{stem}.dmx", corners.dmx_text(
+        tris, P, N, 0.0, uv=lambda x, y: ((x - bx0) / (bx1 - bx0), (by1 - y) / (by1 - by0))))
+    ctx.write(vmat, f"// dota2-tools map renderer: {mat}'s lava layer {layer}, its light baked\n\n"
+              "Layer0\n{\n\tshader \"global_lit_simple.vfx\"\n\tF_FULLBRIGHT 1\n"
+              f"\tTextureColor \"{png}\"\n}}\n")
+    ctx.compile([vmat])
+    vmdl = ctx.write(f"{FOLDER}/{stem}.vmdl", corners.VMDL.format(material=vmat, name=stem,
+                                                                  mesh=f"{FOLDER}/{stem}.dmx"))
+    ctx.compile([vmdl])
+    ctx.add_model(vmdl, stem, (0, 0, float(ctx.options.get("plain_lift", 1.0))))
+    ctx.log(f"lava: {stem} on {mat} layer {layer}")
+
+
 def hidden_source(ctx, mat):
     """A same-length transparent material alias for an original lava mesh."""
     from PIL import Image
@@ -1067,26 +1273,53 @@ def run(ctx):
         if not meshes:
             ctx.log(f"lava: could not decompile {rel}")
             continue
-        if bake_enabled:
-            if mat not in hidden:
-                hidden[mat] = hidden_source(ctx, mat)
-            alias = hidden[mat]
-            ctx.rename_in_map(rel, mat.encode(), alias.encode())
         P, N, sets = meshes[0]
         tint = [bright * c / 255 for c in tints.get(rel[:-2], (255, 255, 255))] \
             if m["ints"].get("F_TINT_MASK") else [bright] * 3
         tint = [t_ * g for t_, g in zip(tint, ctx.options.get("colour_gain", [1.15, 1.6, 2.0]))]
-        groups = spatial_groups(P, sets, group_gap) if bake_enabled else [[t for fs in sets for t in fs]]
         base = Path(rel).name.replace(".vmdl_c", "")
+        # Only the Dire corner's channels get the grown, joined bake; every
+        # other patch (Roshan's pit, the base's small pools) stays as the map
+        # draws it, its light baked over its own mesh.
+        picked = corner_sets(ctx, P, sets) if bake_enabled else set()
+        rest, roshan = [], []
+        for i, fs in enumerate(sets):
+            if i in picked:
+                continue
+            target = roshan if roshan_set(ctx, P, fs) else rest
+            target.extend(fs)
+        if rest:
+            plain_piece(ctx, base if not picked else f"{base}_plain", mat, m, layer, tint, P, N, rest,
+                        data, float(ctx.options.get("plain_repeat", 1200.0)))
+        if roshan:
+            gain = float(ctx.options.get("roshan_brightness", 1.8))
+            plain_piece(ctx, f"{base}_roshan", mat, m, layer, [v * gain for v in tint], P, N, roshan,
+                        data, float(ctx.options.get("plain_repeat", 1200.0)), roshan=True)
+            ctx.log(f"lava: Roshan brightness {gain:g}")
+        if not picked:
+            continue
+        sets = [fs for i, fs in enumerate(sets) if i in picked]
+        south = south_blend(ctx)
+        if south is not None:
+            import numpy as np
+            selected = [t for fs in sets for t in fs]
+            V = np.asarray(P, np.float32)[np.asarray(selected, np.int64)]
+            extent = (float(V[..., 0].min()) - 1, float(V[..., 0].max()) + 1,
+                      float(V[..., 1].min()) - 1, south[1])
+            uP, uN, uT = clip_mesh(P, N, selected, extent)
+            if uT:
+                plain_piece(ctx, f"{base}_south", mat, m, layer, tint, uP, uN, uT,
+                            data, float(ctx.options.get("plain_repeat", 1200.0)))
+        if mat not in hidden:
+            hidden[mat] = hidden_source(ctx, mat)
+        ctx.rename_in_map(rel, mat.encode(), hidden[mat].encode())
+        groups = spatial_groups(P, sets, group_gap)
         if len(groups) > 1:
             ctx.log(f"lava: {base} split into {len(groups)} spatial groups")
         for gi, tris in enumerate(groups):
             stem = base if len(groups) == 1 else f"{base}_g{gi}"
             pieces.append((stem, mat, m, layer, tint, P, N, tris, data))
     if not pieces:
-        ctx.log(f"lava: {ctx.map} has none")
-        if ctx.options.get("grass_noshadow", True):
-            grass_noshadow(ctx, coverage_query(()))
         return
     # Optional shared atlas (usually off: the Dire channel is huge, one atlas
     # hits max_side and looks pixelated). World-space sampling already aligns
@@ -1174,7 +1407,11 @@ def run(ctx):
                 continue
             box, png, oP, oN, oT = bake(ctx, tstem, m, layer, tint, P, tris, repeat, data,
                                         extent=extent, light_cache=light_cache, light_extent=full)
-            oP, oN, oT = clip_mesh(oP, oN, oT, tile_ownership(extent, tiles))
+            ownership = list(tile_ownership(extent, tiles))
+            south = south_blend(ctx)
+            if south is not None:
+                ownership[2] = max(ownership[2], south[0])
+            oP, oN, oT = clip_mesh(oP, oN, oT, ownership)
             if not oT:
                 ctx.log(f"lava: {tstem} overlay empty, skipping")
                 continue

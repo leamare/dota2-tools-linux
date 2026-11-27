@@ -35,6 +35,11 @@ def enabled(ctx):
     return r.get("prerun_enabled", True) and SCRIPT in r.get("prerun", [])
 
 
+# The corner the join is made in (x0, x1, y0, y1): builtin:lava gives its
+# grown, joined bake to the lava face sets reaching into it and the ones
+# they touch (the base's three channels), and to nothing else.
+CORNER_BOX = (7300.0, 8800.0, 6600.0, 8200.0)
+
 DIRE_JOIN = (
     ((7625, 7660), (7700, 7900), (7980, 7900), (8230, 7700), (8470, 7480),
      (8660, 7200), (8660, 6920), (7900, 6840), (7800, 7000), (7800, 7250),

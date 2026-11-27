@@ -127,7 +127,9 @@ DEFAULT_SETTINGS = {
                         "bridge": 512.0, "extend": 128.0, "max_rise": 128.0, "bank": 32.0,
                         "paint_min": 0.1, "join_light": 0.35,
                         "bank_floor": 0.35, "bank_texture": True, "mesh_res": 6.0,
-                        "edge_feather": 6.0, "shared_atlas": False, "grass_noshadow": True},
+                        "edge_feather": 6.0, "shared_atlas": False, "grass_noshadow": True,
+                        "corner_min_y": 4096.0, "corner_south_fade": 512.0, "roshan_brightness": 1.8,
+                        "roshan_edge": 96.0},
                # prerun/dire_lava_corner.py: the Dire base's lava joined round its
                # corner (its options are the lava's, above).
                "dire_lava_corner": {},
